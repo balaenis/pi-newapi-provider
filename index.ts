@@ -1,13 +1,19 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { exec } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+
+import { AuthStorage, getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	type Api,
 	type AssistantMessageEventStream,
 	type Context,
 	createAssistantMessageEventStream,
+	getApiProvider,
+	type GoogleOptions,
+	type GoogleThinkingLevel,
 	type Model,
 	type SimpleStreamOptions,
 	streamSimpleAnthropic,
-	streamSimpleGoogle,
 	streamSimpleOpenAICompletions,
 	streamSimpleOpenAIResponses,
 } from "@earendil-works/pi-ai";
@@ -44,6 +50,8 @@ interface NewApiModelConfig {
 		sendSessionAffinityHeaders?: boolean;
 		sendSessionIdHeader?: boolean;
 		supportsLongCacheRetention?: boolean;
+		supportsTemperature?: boolean;
+		forceAdaptiveThinking?: boolean;
 	};
 }
 
@@ -60,19 +68,59 @@ interface PublicModelMetadata {
 	maxTokens?: number;
 }
 
+interface ModelsJsonProviderConfig {
+	baseUrl?: string;
+	apiKey?: string;
+	headers?: Record<string, string>;
+	authHeader?: boolean;
+}
+
 const NEWAPI_WRAPPER_API = "newapi-gateway" as const;
 const PROVIDER_ID = process.env.NEWAPI_PROVIDER_ID?.trim() || "newapi";
+const MODELS_JSON_PROVIDER_CONFIG = readModelsJsonProviderConfig(PROVIDER_ID);
 const PROVIDER_NAME = process.env.NEWAPI_PROVIDER_NAME?.trim() || "NewAPI Gateway";
-const BASE_URL = normalizeGatewayBaseUrl(process.env.NEWAPI_BASE_URL || "http://localhost:3000");
+const BASE_URL = normalizeGatewayBaseUrl(
+	MODELS_JSON_PROVIDER_CONFIG?.baseUrl ?? process.env.NEWAPI_BASE_URL ?? "http://localhost:3000",
+);
 const MODELS_DEV_URL = process.env.NEWAPI_MODELS_DEV_URL?.trim() || "https://models.dev/models.json";
+const PROVIDER_API_KEY = MODELS_JSON_PROVIDER_CONFIG?.apiKey ?? "$NEWAPI_API_KEY";
 
 const DEFAULT_CONTEXT_WINDOW = parsePositiveInteger(process.env.NEWAPI_CONTEXT_WINDOW, 128_000);
 const DEFAULT_MAX_TOKENS = parsePositiveInteger(process.env.NEWAPI_MAX_TOKENS, 4096);
 const DEFAULT_REASONING = parseBoolean(process.env.NEWAPI_REASONING, false);
 const DEFAULT_INPUT = parseInputs(process.env.NEWAPI_INPUTS || "text");
-const SESSION_ID_HEADER = process.env.NEWAPI_SESSION_ID_HEADER?.trim() || "session_id";
-const EXTRA_HEADERS = parseHeaders(process.env.NEWAPI_HEADERS);
+const SESSION_ID_HEADER = process.env.NEWAPI_SESSION_ID_HEADER?.trim() || "x-session-id";
+const DEBUG_SESSION_HEADERS = parseBoolean(process.env.NEWAPI_DEBUG_SESSION_HEADERS, false);
+const EXTRA_HEADERS = MODELS_JSON_PROVIDER_CONFIG?.headers ?? parseHeaders(process.env.NEWAPI_HEADERS);
+const AUTH_HEADER = MODELS_JSON_PROVIDER_CONFIG?.authHeader;
 const ROUTES_BY_MODEL_ID = new Map<string, { api: NewApiBackendApi; baseUrl: string }>();
+
+function readModelsJsonProviderConfig(providerId: string): ModelsJsonProviderConfig | undefined {
+	const modelsPath = join(getAgentDir(), "models.json");
+	if (!existsSync(modelsPath)) return undefined;
+
+	try {
+		const payload = asRecord(JSON.parse(readFileSync(modelsPath, "utf8")) as unknown);
+		const providers = asRecord(payload?.providers);
+		const provider = asRecord(providers?.[providerId]);
+		if (!provider) return undefined;
+
+		const headers = readHeaderRecord(provider.headers);
+		const authHeader = typeof provider.authHeader === "boolean" ? provider.authHeader : undefined;
+
+		return {
+			...(readString(provider, "baseUrl") ? { baseUrl: readString(provider, "baseUrl") } : {}),
+			...(readString(provider, "apiKey") ? { apiKey: readString(provider, "apiKey") } : {}),
+			...(headers ? { headers } : {}),
+			...(authHeader !== undefined ? { authHeader } : {}),
+		};
+	} catch (error) {
+		console.warn(
+			`[${PROVIDER_ID}] Failed to read models.json provider config: ${error instanceof Error ? error.message : String(error)}`,
+		);
+		return undefined;
+	}
+}
 
 const OFFICIAL_MODELS_DEV_PATTERNS: Array<{ provider: string; model: RegExp }> = [
 	{ provider: "deepseek", model: /^deepseek/i },
@@ -95,10 +143,11 @@ export default async function (pi: ExtensionAPI) {
 	pi.registerProvider(PROVIDER_ID, {
 		name: PROVIDER_NAME,
 		baseUrl: getOpenAiBaseUrl(),
-		apiKey: "$NEWAPI_API_KEY",
+		apiKey: PROVIDER_API_KEY,
 		api: NEWAPI_WRAPPER_API,
 		streamSimple: streamNewApiGateway,
 		...(Object.keys(EXTRA_HEADERS).length > 0 ? { headers: EXTRA_HEADERS } : {}),
+		...(AUTH_HEADER !== undefined ? { authHeader: AUTH_HEADER } : {}),
 		models,
 	});
 }
@@ -114,7 +163,7 @@ function streamNewApiGateway(
 		try {
 			const route = ROUTES_BY_MODEL_ID.get(model.id) ?? getModelRoute(model.id, undefined);
 			const routedModel = { ...model, api: route.api, baseUrl: route.baseUrl };
-			const routedOptions = addSessionIdHeader(options);
+			const routedOptions = await addModelsJsonRequestAuth(addSessionIdHeader(options));
 			const innerStream = streamBackendApi(route.api, routedModel, context, routedOptions);
 
 			for await (const event of innerStream) stream.push(event);
@@ -151,14 +200,42 @@ function streamNewApiGateway(
 
 function addSessionIdHeader(options: SimpleStreamOptions | undefined): SimpleStreamOptions | undefined {
 	const sessionId = options?.cacheRetention === "none" ? undefined : options?.sessionId;
-	if (!sessionId) return options;
+	if (!sessionId) {
+		if (DEBUG_SESSION_HEADERS) {
+			console.warn(`[${PROVIDER_ID}] No session id available for request; ${SESSION_ID_HEADER} was not injected.`);
+		}
+		return options;
+	}
+
+	const headers = {
+		...(options?.headers ?? {}),
+		[SESSION_ID_HEADER]: sessionId,
+	};
+
+	if (DEBUG_SESSION_HEADERS) {
+		console.warn(`[${PROVIDER_ID}] Injected ${SESSION_ID_HEADER} for session ${sessionId}.`);
+	}
 
 	return {
 		...(options ?? {}),
-		headers: {
-			...(options?.headers ?? {}),
-			[SESSION_ID_HEADER]: sessionId,
-		},
+		headers,
+	};
+}
+
+async function addModelsJsonRequestAuth(
+	options: SimpleStreamOptions | undefined,
+): Promise<SimpleStreamOptions | undefined> {
+	const apiKey = await resolveConfigValue(MODELS_JSON_PROVIDER_CONFIG?.apiKey);
+	if (!apiKey) return options;
+
+	const headers = MODELS_JSON_PROVIDER_CONFIG?.authHeader
+		? { ...(options?.headers ?? {}), Authorization: `Bearer ${apiKey}` }
+		: options?.headers;
+
+	return {
+		...(options ?? {}),
+		apiKey,
+		...(headers && Object.keys(headers).length > 0 ? { headers } : {}),
 	};
 }
 
@@ -172,7 +249,7 @@ function streamBackendApi(
 		case "anthropic-messages":
 			return streamSimpleAnthropic(model as Model<"anthropic-messages">, context, options);
 		case "google-generative-ai":
-			return streamSimpleGoogle(model as Model<"google-generative-ai">, context, options);
+			return streamNewApiGoogle(model as Model<"google-generative-ai">, context, options);
 		case "openai-responses":
 			return streamSimpleOpenAIResponses(model as Model<"openai-responses">, context, options);
 		case "openai-completions":
@@ -180,18 +257,82 @@ function streamBackendApi(
 	}
 }
 
+function streamNewApiGoogle(
+	model: Model<"google-generative-ai">,
+	context: Context,
+	options: SimpleStreamOptions | undefined,
+): AssistantMessageEventStream {
+	const provider = getApiProvider("google-generative-ai");
+	if (!provider) throw new Error("Google Generative AI provider is not registered");
+
+	return provider.stream(model, context, {
+		...options,
+		thinking: getGoogleThinkingConfig(model.id, options?.reasoning),
+	} as GoogleOptions);
+}
+
+function getGoogleThinkingConfig(
+	modelId: string,
+	reasoning: SimpleStreamOptions["reasoning"] | undefined,
+): { enabled: boolean; budgetTokens?: number; level?: GoogleThinkingLevel } {
+	if (!reasoning) {
+		return isGemini25ProModelId(modelId) ? { enabled: true, budgetTokens: 128 } : { enabled: false };
+	}
+
+	if (isGemini25ModelId(modelId)) {
+		return { enabled: true, budgetTokens: getGemini25ThinkingBudget(modelId, reasoning) };
+	}
+
+	return { enabled: true, level: getGeminiThinkingLevel(modelId, reasoning) };
+}
+
+function getGeminiThinkingLevel(
+	modelId: string,
+	reasoning: NonNullable<SimpleStreamOptions["reasoning"]>,
+): GoogleThinkingLevel {
+	if (isGemini31ProModelId(modelId)) {
+		return reasoning === "low" ? "LOW" : reasoning === "medium" ? "MEDIUM" : "HIGH";
+	}
+	if (isGemini3ProModelId(modelId)) {
+		return reasoning === "low" ? "LOW" : "HIGH";
+	}
+
+	switch (reasoning) {
+		case "minimal":
+			return "MINIMAL";
+		case "low":
+			return "LOW";
+		case "medium":
+			return "MEDIUM";
+		case "high":
+		case "xhigh":
+			return "HIGH";
+	}
+}
+
+function getGemini25ThinkingBudget(modelId: string, reasoning: NonNullable<SimpleStreamOptions["reasoning"]>): number {
+	if (isGemini25ProModelId(modelId)) {
+		const budgets = { minimal: 128, low: 2048, medium: 8192, high: 32768, xhigh: 32768 };
+		return budgets[reasoning];
+	}
+	if (modelId.includes("gemini-2.5-flash-lite")) {
+		const budgets = { minimal: 512, low: 2048, medium: 8192, high: 24576, xhigh: 24576 };
+		return budgets[reasoning];
+	}
+
+	const budgets = { minimal: 128, low: 2048, medium: 8192, high: 24576, xhigh: 24576 };
+	return budgets[reasoning];
+}
+
 async function discoverModels(publicModelMetadata: Map<string, PublicModelMetadata>): Promise<NewApiModelConfig[]> {
 	if (process.env.NEWAPI_FETCH_MODELS === "false") return [];
 
-	const apiKey = process.env.NEWAPI_API_KEY;
+	const apiKey = await getNewApiApiKey();
 	if (!apiKey) return [];
 
 	try {
 		const response = await fetch(`${getOpenAiBaseUrl()}/models`, {
-			headers: {
-				Authorization: `Bearer ${apiKey}`,
-				...EXTRA_HEADERS,
-			},
+			headers: await getNewApiDiscoveryHeaders(apiKey),
 		});
 
 		if (!response.ok) {
@@ -211,6 +352,107 @@ async function discoverModels(publicModelMetadata: Map<string, PublicModelMetada
 	}
 }
 
+async function getNewApiApiKey(): Promise<string | undefined> {
+	const configuredApiKey = await resolveConfigValue(MODELS_JSON_PROVIDER_CONFIG?.apiKey);
+	if (configuredApiKey) return configuredApiKey;
+
+	const authStorage = AuthStorage.create();
+	if (authStorage.has(PROVIDER_ID)) {
+		return await authStorage.getApiKey(PROVIDER_ID, { includeFallback: false });
+	}
+
+	return process.env.NEWAPI_API_KEY;
+}
+
+async function getNewApiDiscoveryHeaders(apiKey: string): Promise<Record<string, string>> {
+	return {
+		Authorization: `Bearer ${apiKey}`,
+		...(await resolveHeaders(EXTRA_HEADERS)),
+	};
+}
+
+async function resolveHeaders(
+	headers: Record<string, string> | undefined,
+): Promise<Record<string, string> | undefined> {
+	if (!headers) return undefined;
+
+	const resolvedEntries = await Promise.all(
+		Object.entries(headers).map(async ([key, value]) => [key, await resolveConfigValue(value)] as const),
+	);
+	const resolvedHeaders = Object.fromEntries(
+		resolvedEntries.filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+	);
+
+	return Object.keys(resolvedHeaders).length > 0 ? resolvedHeaders : undefined;
+}
+
+async function resolveConfigValue(value: string | undefined): Promise<string | undefined> {
+	if (!value) return undefined;
+	if (value.startsWith("!")) return await execConfigCommand(value.slice(1));
+	return resolveEnvironmentReferences(value);
+}
+
+function execConfigCommand(command: string): Promise<string | undefined> {
+	return new Promise((resolve) => {
+		exec(command, (error, stdout) => {
+			if (error) {
+				console.warn(`[${PROVIDER_ID}] Failed to resolve models.json command: ${error.message}`);
+				resolve(undefined);
+				return;
+			}
+
+			const value = stdout.trim();
+			resolve(value.length > 0 ? value : undefined);
+		});
+	});
+}
+
+function resolveEnvironmentReferences(value: string): string | undefined {
+	let resolved = "";
+
+	for (let index = 0; index < value.length; index++) {
+		const char = value[index];
+		if (char !== "$") {
+			resolved += char;
+			continue;
+		}
+
+		const next = value[index + 1];
+		if (next === "$" || next === "!") {
+			resolved += next;
+			index++;
+			continue;
+		}
+
+		if (next === "{") {
+			const end = value.indexOf("}", index + 2);
+			if (end === -1) {
+				resolved += char;
+				continue;
+			}
+
+			const envValue = process.env[value.slice(index + 2, end)];
+			if (envValue === undefined) return undefined;
+			resolved += envValue;
+			index = end;
+			continue;
+		}
+
+		const match = /^[A-Za-z_][A-Za-z0-9_]*/.exec(value.slice(index + 1));
+		if (!match) {
+			resolved += char;
+			continue;
+		}
+
+		const envValue = process.env[match[0]];
+		if (envValue === undefined) return undefined;
+		resolved += envValue;
+		index += match[0].length;
+	}
+
+	return resolved;
+}
+
 function modelsFromEnvironment(publicModelMetadata: Map<string, PublicModelMetadata>): NewApiModelConfig[] {
 	const ids = (process.env.NEWAPI_MODELS || "gpt-4o-mini")
 		.split(",")
@@ -224,8 +466,8 @@ function toProviderModel(id: string, publicModelMetadata: Map<string, PublicMode
 	const metadata = findPublicModelMetadata(id, publicModelMetadata);
 	const route = getModelRoute(id, metadata);
 	ROUTES_BY_MODEL_ID.set(id, route);
-	const reasoning =
-		metadata?.reasoning ?? (DEFAULT_REASONING || /(?:^|[-_/])(o\d|reasoner|r1|thinking)(?:$|[-_/])/i.test(id));
+	const candidates = getModelRouteCandidates(id, metadata);
+	const reasoning = metadata?.reasoning ?? (DEFAULT_REASONING || candidates.some(supportsThinking));
 	const compat = getModelCompat(id, metadata, reasoning);
 	const thinkingLevelMap = getThinkingLevelMap(id, metadata);
 
@@ -341,6 +583,16 @@ function readString(record: Record<string, unknown>, key: string): string | unde
 	return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
 }
 
+function readHeaderRecord(value: unknown): Record<string, string> | undefined {
+	const record = asRecord(value);
+	if (!record) return undefined;
+
+	const headers = Object.fromEntries(
+		Object.entries(record).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+	);
+	return Object.keys(headers).length > 0 ? headers : undefined;
+}
+
 function readPositiveInteger(record: Record<string, unknown> | undefined, key: string): number | undefined {
 	if (!record) return undefined;
 
@@ -415,8 +667,12 @@ function getModelCompat(
 	return {
 		supportsDeveloperRole: candidates.some(isOpenAiModelId),
 		maxTokensField: getMaxTokensField(candidates),
+		sendSessionAffinityHeaders: true,
+		sendSessionIdHeader: true,
 		...(reasoning ? { supportsReasoningEffort: supportsReasoningEffort(candidates) } : {}),
 		...(thinkingFormat ? { thinkingFormat } : {}),
+		...(candidates.some(usesClaudeAdaptiveThinking) ? { forceAdaptiveThinking: true } : {}),
+		...(candidates.some(isClaudeAdaptiveTemperatureUnsupported) ? { supportsTemperature: false } : {}),
 	};
 }
 
@@ -430,15 +686,79 @@ function getThinkingFormat(candidates: string[]): ThinkingFormat | undefined {
 
 function getThinkingLevelMap(id: string, metadata: PublicModelMetadata | undefined): ThinkingLevelMap | undefined {
 	const candidates = getModelRouteCandidates(id, metadata);
-	if (!candidates.some(isDeepSeekModelId)) return undefined;
 
-	return {
-		minimal: null,
-		low: null,
-		medium: null,
-		high: "high",
-		xhigh: "max",
-	};
+	if (candidates.some(isDeepSeekModelId)) {
+		return {
+			minimal: null,
+			low: null,
+			medium: null,
+			high: "high",
+			xhigh: "max",
+		};
+	}
+
+	return (
+		getGeminiThinkingLevelMap(candidates) ??
+		getClaudeThinkingLevelMap(candidates) ??
+		getOpenAiThinkingLevelMap(candidates)
+	);
+}
+
+function getGeminiThinkingLevelMap(candidates: string[]): ThinkingLevelMap | undefined {
+	if (candidates.some(isGemini31ProModelId)) {
+		return { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: null };
+	}
+	if (candidates.some(isGemini3ProModelId)) {
+		return { off: null, minimal: null, low: "low", medium: null, high: "high", xhigh: null };
+	}
+	if (candidates.some(isGemini3ModelId)) {
+		return { off: null, minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: null };
+	}
+	if (candidates.some(isGemini25ProModelId)) {
+		return { off: null, minimal: "128", low: "2048", medium: "8192", high: "32768", xhigh: null };
+	}
+	if (candidates.some(isGemini25ModelId)) {
+		return { minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: null };
+	}
+
+	return undefined;
+}
+
+function getClaudeThinkingLevelMap(candidates: string[]): ThinkingLevelMap | undefined {
+	if (candidates.some(isClaudeOpus47OrLaterModelId)) {
+		return { minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh" };
+	}
+	if (candidates.some(isClaudeAdaptiveMaxModelId)) {
+		return { minimal: null, low: "low", medium: "medium", high: "high", xhigh: "max" };
+	}
+	if (candidates.some(isClaudeEffortModelId)) {
+		return { minimal: null, low: "low", medium: "medium", high: "high", xhigh: null };
+	}
+
+	return undefined;
+}
+
+function getOpenAiThinkingLevelMap(candidates: string[]): ThinkingLevelMap | undefined {
+	if (candidates.some(isGptProReasoningModelId)) {
+		return { off: null, minimal: null, low: null, medium: null, high: "high", xhigh: null };
+	}
+	if (candidates.some(isGpt51CodexMaxModelId)) {
+		return { off: "none", minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh" };
+	}
+	if (candidates.some(isGpt51ReasoningModelId)) {
+		return { off: "none", minimal: null, low: "low", medium: "medium", high: "high", xhigh: null };
+	}
+	if (candidates.some(isLatestGptReasoningModelId)) {
+		return { off: "none", minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh" };
+	}
+	if (candidates.some(isGpt5ReasoningModelId)) {
+		return { off: null, minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: null };
+	}
+	if (candidates.some(isOpenAiOModelId)) {
+		return { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: null };
+	}
+
+	return undefined;
 }
 
 function getMaxTokensField(candidates: string[]): MaxTokensField {
@@ -450,12 +770,42 @@ function supportsReasoningEffort(candidates: string[]): boolean {
 	return candidates.some(isOpenAiReasoningModelId) || candidates.some(isDeepSeekModelId);
 }
 
+function supportsThinking(id: string): boolean {
+	return (
+		isOpenAiReasoningModelId(id) || isDeepSeekModelId(id) || isGeminiThinkingModelId(id) || isClaudeThinkingModelId(id)
+	);
+}
+
 function isOpenAiModelId(id: string): boolean {
-	return id.startsWith("openai/gpt") || id.startsWith("gpt") || /^openai\/o\d/.test(id) || /^o\d/.test(id);
+	return id.startsWith("openai/gpt") || id.startsWith("gpt") || isOpenAiOModelId(id);
 }
 
 function isOpenAiReasoningModelId(id: string): boolean {
-	return id.startsWith("openai/gpt-5") || id.startsWith("gpt-5") || /^openai\/o\d/.test(id) || /^o\d/.test(id);
+	return isGpt5ReasoningModelId(id) || isOpenAiOModelId(id);
+}
+
+function isOpenAiOModelId(id: string): boolean {
+	return /^openai\/o\d/.test(id) || /^o\d/.test(id);
+}
+
+function isGpt5ReasoningModelId(id: string): boolean {
+	return id.startsWith("openai/gpt-5") || id.startsWith("gpt-5");
+}
+
+function isLatestGptReasoningModelId(id: string): boolean {
+	return /^(?:openai\/)?gpt-5\.(?:4|5)(?:$|[-_/])/.test(id);
+}
+
+function isGpt51ReasoningModelId(id: string): boolean {
+	return /^(?:openai\/)?gpt-5\.1(?:$|[-_/])/.test(id);
+}
+
+function isGpt51CodexMaxModelId(id: string): boolean {
+	return /^(?:openai\/)?gpt-5\.1-codex-max(?:$|[-_/])/.test(id);
+}
+
+function isGptProReasoningModelId(id: string): boolean {
+	return /^(?:openai\/)?gpt-5(?:\.\d+)?-pro(?:$|[-_/])/.test(id);
 }
 
 function usesMaxTokensField(id: string): boolean {
@@ -483,6 +833,84 @@ function isQwenModelId(id: string): boolean {
 
 function isGlmModelId(id: string): boolean {
 	return id.startsWith("zhipuai/glm") || id.startsWith("glm");
+}
+
+function isGeminiThinkingModelId(id: string): boolean {
+	return isGemini25ModelId(id) || isGemini3ModelId(id);
+}
+
+function isGemini25ModelId(id: string): boolean {
+	return id.includes("gemini-2.5-");
+}
+
+function isGemini25ProModelId(id: string): boolean {
+	return id.includes("gemini-2.5-pro");
+}
+
+function isGemini3ModelId(id: string): boolean {
+	return /gemini-3(?:\.\d+)?-/.test(id);
+}
+
+function isGemini31ProModelId(id: string): boolean {
+	return id.includes("gemini-3.1-pro");
+}
+
+function isGemini3ProModelId(id: string): boolean {
+	return id.includes("gemini-3-pro") || id.includes("gemini-3.0-pro");
+}
+
+function isClaudeThinkingModelId(id: string): boolean {
+	const version = getClaudeVersion(id);
+	return (
+		id.includes("claude-mythos") || !!(version && (version.major >= 4 || (version.major === 3 && version.minor >= 7)))
+	);
+}
+
+function usesClaudeAdaptiveThinking(id: string): boolean {
+	const version = getClaudeVersion(id);
+	if (id.includes("claude-mythos")) return true;
+	if (!version) return false;
+	if (version.family === "opus") return version.major > 4 || (version.major === 4 && version.minor >= 6);
+	if (version.family === "sonnet") return version.major > 4 || (version.major === 4 && version.minor >= 6);
+	return false;
+}
+
+function isClaudeAdaptiveTemperatureUnsupported(id: string): boolean {
+	const version = getClaudeVersion(id);
+	return id.includes("claude-mythos") || !!(version?.family === "opus" && version.major === 4 && version.minor >= 7);
+}
+
+function isClaudeOpus47OrLaterModelId(id: string): boolean {
+	const version = getClaudeVersion(id);
+	return !!(version?.family === "opus" && version.major === 4 && version.minor >= 7);
+}
+
+function isClaudeAdaptiveMaxModelId(id: string): boolean {
+	const version = getClaudeVersion(id);
+	if (id.includes("claude-mythos")) return true;
+	return !!(
+		version &&
+		((version.family === "opus" && version.major === 4 && version.minor === 6) ||
+			(version.family === "sonnet" && version.major === 4 && version.minor === 6))
+	);
+}
+
+function isClaudeEffortModelId(id: string): boolean {
+	const version = getClaudeVersion(id);
+	return id.includes("claude-mythos") || !!(version?.family === "opus" && version.major === 4 && version.minor >= 5);
+}
+
+function getClaudeVersion(
+	id: string,
+): { family: "opus" | "sonnet" | "haiku"; major: number; minor: number } | undefined {
+	const match = /claude-(opus|sonnet|haiku)-(\d+)(?:[.-](\d+))?/.exec(id);
+	if (!match) return undefined;
+
+	return {
+		family: match[1] as "opus" | "sonnet" | "haiku",
+		major: Number(match[2]),
+		minor: match[3] ? Number(match[3]) : 0,
+	};
 }
 
 function getOpenAiBaseUrl(): string {
