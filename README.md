@@ -5,16 +5,21 @@ A pi custom provider template for NewAPI gateways.
 ## Usage
 
 ```bash
+# Install
+pi install https://github.com/pzyyll/pi-newapi-provider
+```
+
+Set `NEWAPI_*` values in the environment before starting pi. This extension does not load `.env` files.
+
+```bash
 export NEWAPI_BASE_URL="http://localhost:3000"
 
 # Option 1: provide the API key through the environment
 export NEWAPI_API_KEY="sk-..."
 
 # Test this local package directly
-pi -e .
+# pi -e .
 ```
-
-Set `NEWAPI_*` values in the environment before starting pi. This extension does not load `.env` files.
 
 You can also configure the matching provider in `~/.pi/agent/models.json`. Provider-level `baseUrl`, `apiKey`, `headers`, and `authHeader` values from `models.json` take precedence over this extension's environment-based settings.
 
