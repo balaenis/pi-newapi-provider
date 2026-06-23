@@ -14,10 +14,8 @@ import {
 	type GoogleThinkingLevel,
 	type Model,
 	type SimpleStreamOptions,
-	streamSimpleAnthropic,
-	streamSimpleOpenAICompletions,
-	streamSimpleOpenAIResponses,
-} from "@earendil-works/pi-ai";
+	streamSimple,
+} from "@earendil-works/pi-ai/compat";
 
 type ModelInput = "text" | "image";
 type NewApiBackendApi = "openai-completions" | "openai-responses" | "anthropic-messages" | "google-generative-ai";
@@ -526,13 +524,13 @@ function streamBackendApi(
 ): AssistantMessageEventStream {
 	switch (api) {
 		case "anthropic-messages":
-			return streamSimpleAnthropic(model as Model<"anthropic-messages">, context, options);
+			return streamSimple(model as Model<"anthropic-messages">, context, options);
 		case "google-generative-ai":
 			return streamNewApiGoogle(model as Model<"google-generative-ai">, context, options);
 		case "openai-responses":
-			return streamSimpleOpenAIResponses(model as Model<"openai-responses">, context, options);
+			return streamSimple(model as Model<"openai-responses">, context, options);
 		case "openai-completions":
-			return streamSimpleOpenAICompletions(model as Model<"openai-completions">, context, options);
+			return streamSimple(model as Model<"openai-completions">, context, options);
 	}
 }
 
