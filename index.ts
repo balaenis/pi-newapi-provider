@@ -367,9 +367,23 @@ export default async function (pi: ExtensionAPI) {
 
 	registerNewApiProvider(pi, providerModels.models);
 
-	if (providerModels.shouldRefresh) {
-		void refreshProviderModelsInBackground(pi, providerModels.publicModelMetadata, providerModels.discoveredModelIds);
-	}
+	if (!providerModels.shouldRefresh) return;
+
+	// The `pi` captured here goes stale when this extension instance is replaced
+	// (session switch, fork, reload). The new instance re-runs the factory with a
+	// fresh `pi`, so the old background refresh has nothing useful left to do —
+	// cancel it on `session_shutdown` and never call `registerProvider` after that.
+	const refreshAbort = new AbortController();
+	pi.on("session_shutdown", () => {
+		refreshAbort.abort();
+	});
+
+	void refreshProviderModelsInBackground(
+		pi,
+		providerModels.publicModelMetadata,
+		providerModels.discoveredModelIds,
+		refreshAbort.signal,
+	);
 }
 
 async function loadProviderModels(): Promise<ProviderModelLoadResult> {
@@ -392,6 +406,7 @@ async function refreshProviderModelsInBackground(
 	pi: ExtensionAPI,
 	currentPublicModelMetadata: Map<string, PublicModelMetadata>,
 	currentDiscoveredModelIds: string[],
+	signal: AbortSignal,
 ): Promise<void> {
 	try {
 		const [publicModelMetadataEntries, discoveredModelIds] = await Promise.all([
@@ -399,6 +414,7 @@ async function refreshProviderModelsInBackground(
 			refreshDiscoveredModelIdsCache(),
 		]);
 
+		if (signal.aborted) return;
 		if (publicModelMetadataEntries === undefined && discoveredModelIds === undefined) return;
 
 		const publicModelMetadata = publicModelMetadataEntries
@@ -410,6 +426,7 @@ async function refreshProviderModelsInBackground(
 
 		registerNewApiProvider(pi, models);
 	} catch (error) {
+		if (signal.aborted) return;
 		console.warn(
 			`[${PROVIDER_ID}] Failed to refresh model cache: ${error instanceof Error ? error.message : String(error)}`,
 		);
