@@ -1061,7 +1061,7 @@ function getThinkingFormat(candidates: string[]): ThinkingFormat | undefined {
 function getThinkingLevelMap(id: string, metadata: PublicModelMetadata | undefined): ThinkingLevelMap | undefined {
 	const candidates = getModelRouteCandidates(id, metadata);
 
-	if (candidates.some(isDeepSeekModelId)) {
+	if (candidates.some(isDeepSeekModelId) || candidates.some(isGlmModelId)) {
 		return {
 			minimal: null,
 			low: null,
@@ -1141,12 +1141,18 @@ function getMaxTokensField(candidates: string[]): MaxTokensField {
 }
 
 function supportsReasoningEffort(candidates: string[]): boolean {
-	return candidates.some(isOpenAiReasoningModelId) || candidates.some(isDeepSeekModelId);
+	return (
+		candidates.some(isOpenAiReasoningModelId) || candidates.some(isDeepSeekModelId) || candidates.some(isGlmModelId)
+	);
 }
 
 function supportsThinking(id: string): boolean {
 	return (
-		isOpenAiReasoningModelId(id) || isDeepSeekModelId(id) || isGeminiThinkingModelId(id) || isClaudeThinkingModelId(id)
+		isOpenAiReasoningModelId(id) ||
+		isDeepSeekModelId(id) ||
+		isGeminiThinkingModelId(id) ||
+		isClaudeThinkingModelId(id) ||
+		isGlmModelId(id)
 	);
 }
 
