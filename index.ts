@@ -20,7 +20,7 @@ import {
 type ModelInput = "text" | "image";
 type NewApiBackendApi = "openai-completions" | "openai-responses" | "anthropic-messages" | "google-generative-ai";
 type NewApiModelApi = typeof NEWAPI_WRAPPER_API;
-type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 type ThinkingLevelMap = Partial<Record<ThinkingLevel, string | null>>;
 type MaxTokensField = "max_tokens" | "max_completion_tokens";
 type ThinkingFormat = "openai" | "openrouter" | "deepseek" | "together" | "zai" | "qwen" | "qwen-chat-template";
@@ -600,21 +600,22 @@ function getGeminiThinkingLevel(
 			return "MEDIUM";
 		case "high":
 		case "xhigh":
+		case "max":
 			return "HIGH";
 	}
 }
 
 function getGemini25ThinkingBudget(modelId: string, reasoning: NonNullable<SimpleStreamOptions["reasoning"]>): number {
 	if (isGemini25ProModelId(modelId)) {
-		const budgets = { minimal: 128, low: 2048, medium: 8192, high: 32768, xhigh: 32768 };
+		const budgets = { minimal: 128, low: 2048, medium: 8192, high: 32768, xhigh: 32768, max: 32768 };
 		return budgets[reasoning];
 	}
 	if (modelId.includes("gemini-2.5-flash-lite")) {
-		const budgets = { minimal: 512, low: 2048, medium: 8192, high: 24576, xhigh: 24576 };
+		const budgets = { minimal: 512, low: 2048, medium: 8192, high: 24576, xhigh: 24576, max: 24576 };
 		return budgets[reasoning];
 	}
 
-	const budgets = { minimal: 128, low: 2048, medium: 8192, high: 24576, xhigh: 24576 };
+	const budgets = { minimal: 128, low: 2048, medium: 8192, high: 24576, xhigh: 24576, max: 24576 };
 	return budgets[reasoning];
 }
 
@@ -1067,7 +1068,8 @@ function getThinkingLevelMap(id: string, metadata: PublicModelMetadata | undefin
 			low: null,
 			medium: null,
 			high: "high",
-			xhigh: "max",
+			xhigh: null,
+			max: "max",
 		};
 	}
 
@@ -1080,19 +1082,19 @@ function getThinkingLevelMap(id: string, metadata: PublicModelMetadata | undefin
 
 function getGeminiThinkingLevelMap(candidates: string[]): ThinkingLevelMap | undefined {
 	if (candidates.some(isGemini31ProModelId)) {
-		return { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: null };
+		return { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: null, max: null };
 	}
 	if (candidates.some(isGemini3ProModelId)) {
-		return { off: null, minimal: null, low: "low", medium: null, high: "high", xhigh: null };
+		return { off: null, minimal: null, low: "low", medium: null, high: "high", xhigh: null, max: null };
 	}
 	if (candidates.some(isGemini3ModelId)) {
-		return { off: null, minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: null };
+		return { off: null, minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: null, max: null };
 	}
 	if (candidates.some(isGemini25ProModelId)) {
-		return { off: null, minimal: "128", low: "2048", medium: "8192", high: "32768", xhigh: null };
+		return { off: null, minimal: "128", low: "2048", medium: "8192", high: "32768", xhigh: null, max: null };
 	}
 	if (candidates.some(isGemini25ModelId)) {
-		return { minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: null };
+		return { minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: null, max: null };
 	}
 
 	return undefined;
@@ -1100,13 +1102,13 @@ function getGeminiThinkingLevelMap(candidates: string[]): ThinkingLevelMap | und
 
 function getClaudeThinkingLevelMap(candidates: string[]): ThinkingLevelMap | undefined {
 	if (candidates.some(isClaudeOpus47OrLaterModelId)) {
-		return { minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh" };
+		return { minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" };
 	}
 	if (candidates.some(isClaudeAdaptiveMaxModelId)) {
-		return { minimal: null, low: "low", medium: "medium", high: "high", xhigh: "max" };
+		return { minimal: null, low: "low", medium: "medium", high: "high", xhigh: null, max: "max" };
 	}
 	if (candidates.some(isClaudeEffortModelId)) {
-		return { minimal: null, low: "low", medium: "medium", high: "high", xhigh: null };
+		return { minimal: null, low: "low", medium: "medium", high: "high", xhigh: null, max: null };
 	}
 
 	return undefined;
@@ -1114,22 +1116,41 @@ function getClaudeThinkingLevelMap(candidates: string[]): ThinkingLevelMap | und
 
 function getOpenAiThinkingLevelMap(candidates: string[]): ThinkingLevelMap | undefined {
 	if (candidates.some(isGptProReasoningModelId)) {
-		return { off: null, minimal: null, low: null, medium: null, high: "high", xhigh: null };
+		return { off: null, minimal: null, low: null, medium: null, high: "high", xhigh: null, max: null };
 	}
 	if (candidates.some(isGpt51CodexMaxModelId)) {
-		return { off: "none", minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh" };
+		return { off: "none", minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: null };
 	}
 	if (candidates.some(isGpt51ReasoningModelId)) {
-		return { off: "none", minimal: null, low: "low", medium: "medium", high: "high", xhigh: null };
+		return { off: "none", minimal: null, low: "low", medium: "medium", high: "high", xhigh: null, max: null };
+	}
+	if (candidates.some(isGpt56ReasoningModelId)) {
+		return {
+			off: "none",
+			minimal: "minimal",
+			low: "low",
+			medium: "medium",
+			high: "high",
+			xhigh: "xhigh",
+			max: "max",
+		};
 	}
 	if (candidates.some(isLatestGptReasoningModelId)) {
-		return { off: "none", minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh" };
+		return {
+			off: "none",
+			minimal: "minimal",
+			low: "low",
+			medium: "medium",
+			high: "high",
+			xhigh: "xhigh",
+			max: null,
+		};
 	}
 	if (candidates.some(isGpt5ReasoningModelId)) {
-		return { off: null, minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: null };
+		return { off: null, minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: null, max: null };
 	}
 	if (candidates.some(isOpenAiOModelId)) {
-		return { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: null };
+		return { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: null, max: null };
 	}
 
 	return undefined;
@@ -1172,6 +1193,10 @@ function isGpt5ReasoningModelId(id: string): boolean {
 	return id.startsWith("openai/gpt-5") || id.startsWith("gpt-5");
 }
 
+function isGpt56ReasoningModelId(id: string): boolean {
+	return /^(?:openai\/)?gpt-5\.6(?:$|[-_/])/.test(id);
+}
+
 function isLatestGptReasoningModelId(id: string): boolean {
 	return /^(?:openai\/)?gpt-5\.(?:4|5)(?:$|[-_/])/.test(id);
 }
@@ -1185,6 +1210,8 @@ function isGpt51CodexMaxModelId(id: string): boolean {
 }
 
 function isGptProReasoningModelId(id: string): boolean {
+	// Matches gpt-5-pro / gpt-5.5-pro style IDs. GPT-5.6 pro variants use
+	// names like gpt-5.6-sol-pro and are handled by isGpt56ReasoningModelId.
 	return /^(?:openai\/)?gpt-5(?:\.\d+)?-pro(?:$|[-_/])/.test(id);
 }
 
