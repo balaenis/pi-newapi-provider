@@ -24,6 +24,7 @@ type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "
 type ThinkingLevelMap = Partial<Record<ThinkingLevel, string | null>>;
 type MaxTokensField = "max_tokens" | "max_completion_tokens";
 type ThinkingFormat = "openai" | "openrouter" | "deepseek" | "together" | "zai" | "qwen" | "qwen-chat-template";
+type SessionAffinityFormat = "openai" | "openai-nosession" | "openrouter";
 
 interface NewApiModelConfig {
 	id: string;
@@ -47,7 +48,7 @@ interface NewApiModelConfig {
 		supportsReasoningEffort?: boolean;
 		thinkingFormat?: ThinkingFormat;
 		sendSessionAffinityHeaders?: boolean;
-		sendSessionIdHeader?: boolean;
+		sessionAffinityFormat?: SessionAffinityFormat;
 		supportsLongCacheRetention?: boolean;
 		supportsTemperature?: boolean;
 		forceAdaptiveThinking?: boolean;
@@ -1043,7 +1044,7 @@ function getModelCompat(
 		supportsDeveloperRole: candidates.some(isOpenAiModelId),
 		maxTokensField: getMaxTokensField(candidates),
 		sendSessionAffinityHeaders: true,
-		sendSessionIdHeader: true,
+		sessionAffinityFormat: "openai",
 		...(reasoning ? { supportsReasoningEffort: supportsReasoningEffort(candidates) } : {}),
 		...(thinkingFormat ? { thinkingFormat } : {}),
 		...(candidates.some(usesClaudeAdaptiveThinking) ? { forceAdaptiveThinking: true } : {}),

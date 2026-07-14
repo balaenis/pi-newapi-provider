@@ -39,30 +39,35 @@ if (sessionId && compat.sendSessionAffinityHeaders) {
 
 ### 2. `openai-responses` (OpenAI Responses API)
 
-**源文件**: `packages/ai/src/providers/openai-responses.ts`
+**源文件**: `packages/ai/src/api/openai-responses.ts`
 
-**机制**: 受 `compat.sendSessionIdHeader` 控制（默认 `true`）
+**机制**: 受 `compat.sessionAffinityFormat` 控制（默认自动检测：OpenRouter 为 `"openrouter"`，其余为 `"openai"`）
 
 - **条件**: `sessionId` 非空 + `cacheRetention !== "none"`
 - **HTTP Headers**:
-  - `session_id` → 仅当 `compat.sendSessionIdHeader === true`（默认 true）
-  - `x-client-request-id` → `sessionId`（无条件发送）
+  - `session_id` → 仅当 `compat.sessionAffinityFormat === "openai"`
+  - `x-client-request-id` → `sessionId`（当 `sessionAffinityFormat` 为 `"openai"` 或 `"openai-nosession"` 时发送）
+  - `x-session-id` → `sessionId`（仅当 `compat.sessionAffinityFormat === "openrouter"`）
 - **JSON Body**:
   - `prompt_cache_key` → `clampOpenAIPromptCacheKey(sessionId)`，仅当 `cacheRetention !== "none"`
   - `prompt_cache_retention` → `"24h"`，仅当 `cacheRetention === "long"` 且 `compat.supportsLongCacheRetention === true`
 
-**关键代码 (第 199-203 行)**:
+**关键代码**:
 
 ```typescript
 if (sessionId) {
-	if (compat.sendSessionIdHeader) {
-		headers.session_id = sessionId;
+	if (compat.sessionAffinityFormat === "openrouter") {
+		headers["x-session-id"] = sessionId;
+	} else {
+		if (compat.sessionAffinityFormat === "openai") {
+			headers.session_id = sessionId;
+		}
+		headers["x-client-request-id"] = sessionId;
 	}
-	headers["x-client-request-id"] = sessionId;
 }
 ```
 
-**注意**: `sendSessionIdHeader` 是一个 `OpenAIResponsesCompat` 字段，默认 `true`。通过 `model.compat.sendSessionIdHeader: false` 可以禁用 `session_id` 头，但 `x-client-request-id` 始终发送。
+**注意**: `sessionAffinityFormat` 取代了已移除的 `sendSessionIdHeader` 标志（pi 0.80.7）。取值：`"openai"`（发 `session_id` + `x-client-request-id`，等价于旧 `sendSessionIdHeader: true`）、`"openai-nosession"`（仅 `x-client-request-id`，等价于旧 `sendSessionIdHeader: false`）、`"openrouter"`（仅 `x-session-id`）。默认由 `detectSessionAffinityFormat(model)` 自动检测。
 
 ---
 
@@ -243,10 +248,10 @@ StreamOptions.sessionId
 
 ### `OpenAIResponsesCompat` (types.ts 第 423-427 行)
 
-| 字段                         | 默认值 | 作用                                                       |
-| ---------------------------- | ------ | ---------------------------------------------------------- |
-| `sendSessionIdHeader`        | `true` | 是否发送 `session_id` 头（`x-client-request-id` 不受影响） |
-| `supportsLongCacheRetention` | `true` | 是否支持 `prompt_cache_retention: "24h"`                   |
+| 字段                         | 默认值                     | 作用                                                                                                                                                        |
+| ---------------------------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sessionAffinityFormat`      | auto-detected (`"openai"`) | Session 亲和性头格式：`"openai"` 发送 `session_id` + `x-client-request-id`；`"openai-nosession"` 仅 `x-client-request-id`；`"openrouter"` 仅 `x-session-id` |
+| `supportsLongCacheRetention` | `true`                     | 是否支持 `prompt_cache_retention: "24h"`                                                                                                                    |
 
 ### `AnthropicMessagesCompat` (types.ts 第 442-446 行)
 
@@ -278,7 +283,7 @@ NewAPI 在自定义频道场景中通过 **channel affinity** 机制处理 sessi
 
 1. **`sendSessionAffinityHeaders` 默认 false**：`openai-completions` 的 session 亲和性头默认不发送，必须在模型定义中显式开启
 2. **`session_id` vs `session-id`**：Codex provider 使用连字符版本，其他 OpenAI 兼容 provider 使用下划线版本。如果 NewAPI 的 `pass_headers` 规则只配置了一个版本，可能导致另一个版本不被透传
-3. **`x-client-request-id` 在 `openai-responses` 中无条件发送**：即使 `sendSessionIdHeader: false`，这个头也会发送
+3. **`x-client-request-id` 在 `openai-responses` 中由 `sessionAffinityFormat` 控制**：`"openai"` 和 `"openai-nosession"` 都发送此头，仅 `"openrouter"` 不发送（改发 `x-session-id`）
 4. **Azure 无 header**：Azure OpenAI Responses 只在 body 中发送 `prompt_cache_key`，不发送任何 session 头
 5. **Google/Bedrock 完全不支持**：sessionId 对这些 provider 没有效果
 
@@ -287,7 +292,7 @@ NewAPI 在自定义频道场景中通过 **channel affinity** 机制处理 sessi
 ## 六、Files Likely Needing Changes (for NewAPI custom provider)
 
 1. **`packages/ai/src/providers/openai-completions.ts`** — `createClient()` 函数中的 session affinity headers 逻辑（第 468-471 行）
-2. **`packages/ai/src/providers/openai-responses.ts`** — `createClient()` 函数中的 session_id/`x-client-request-id` 逻辑（第 199-203 行）
+2. **`packages/ai/src/api/openai-responses.ts`** - session 亲和性头逻辑（`sessionAffinityFormat` 控制 `session_id`/`x-client-request-id`/`x-session-id`）
 3. **`packages/ai/src/types.ts`** — `OpenAICompletionsCompat` 和 `OpenAIResponsesCompat` 接口定义（第 413-427 行）
 4. **`packages/ai/src/providers/openai-prompt-cache.ts`** — `clampOpenAIPromptCacheKey` 工具函数
 
@@ -295,4 +300,4 @@ NewAPI 在自定义频道场景中通过 **channel affinity** 机制处理 sessi
 
 ## Start Here
 
-首先看 **`packages/ai/src/providers/openai-completions.ts`** 的 `createClient()` 函数（第 451-487 行）和 `buildParams()` 函数（第 504-610 行），这是 OpenAI 兼容 provider 的核心逻辑，理解 sessionId 如何在 header 和 body 中发送，然后对比 **`packages/ai/src/providers/openai-responses.ts`** 的对应逻辑，确定 NewAPI custom provider 需要复制哪些行为。
+首先看 **`packages/ai/src/providers/openai-completions.ts`** 的 `createClient()` 函数(第 451-487 行)和 `buildParams()` 函数(第 504-610 行),这是 OpenAI 兼容 provider 的核心逻辑,理解 sessionId 如何在 header 和 body 中发送,然后对比 **`packages/ai/src/api/openai-responses.ts`** 的对应逻辑,确定 NewAPI custom provider 需要复制哪些行为。
