@@ -25,6 +25,31 @@ type ThinkingLevelMap = Partial<Record<ThinkingLevel, string | null>>;
 type MaxTokensField = "max_tokens" | "max_completion_tokens";
 type ThinkingFormat = "openai" | "openrouter" | "deepseek" | "together" | "zai" | "qwen" | "qwen-chat-template";
 type SessionAffinityFormat = "openai" | "openai-nosession" | "openrouter";
+type NotifyType = "info" | "warning" | "error";
+type NotifyFn = (message: string, type?: NotifyType) => void;
+
+// Module-level notify bridge: utility code has no ExtensionContext, so bind
+// ctx.ui.notify on session_start and queue any messages that arrive earlier.
+const pendingNotifications: Array<{ message: string; type: NotifyType }> = [];
+let uiNotify: NotifyFn | undefined;
+
+function notify(message: string, type: NotifyType = "warning"): void {
+	if (uiNotify) {
+		uiNotify(message, type);
+		return;
+	}
+	pendingNotifications.push({ message, type });
+}
+
+function bindUiNotify(notifyFn: NotifyFn): void {
+	uiNotify = notifyFn;
+	if (pendingNotifications.length === 0) return;
+
+	const queued = pendingNotifications.splice(0, pendingNotifications.length);
+	for (const item of queued) {
+		uiNotify(item.message, item.type);
+	}
+}
 
 interface NewApiModelConfig {
 	id: string;
@@ -181,8 +206,9 @@ function readModelsJsonProviderConfig(providerId: string): ModelsJsonProviderCon
 			...(authHeader !== undefined ? { authHeader } : {}),
 		};
 	} catch (error) {
-		console.warn(
+		notify(
 			`[${PROVIDER_ID}] Failed to read models.json provider config: ${error instanceof Error ? error.message : String(error)}`,
+			"warning",
 		);
 		return undefined;
 	}
@@ -233,8 +259,9 @@ function readCacheValue<T>(options: CachedValueOptions<T>): CacheReadResult<T> |
 
 		return { value, state: ageMs <= options.ttlMs ? "fresh" : "stale" };
 	} catch (error) {
-		console.warn(
+		notify(
 			`[${PROVIDER_ID}] Failed to read model cache: ${error instanceof Error ? error.message : String(error)}`,
+			"warning",
 		);
 		return undefined;
 	}
@@ -251,8 +278,9 @@ function writeCacheValue<T>(options: CachedValueOptions<T>, value: T): void {
 		};
 		writeFileSync(getCachePath(options.namespace, options.key), JSON.stringify(payload), "utf8");
 	} catch (error) {
-		console.warn(
+		notify(
 			`[${PROVIDER_ID}] Failed to write model cache: ${error instanceof Error ? error.message : String(error)}`,
+			"warning",
 		);
 	}
 }
@@ -364,6 +392,10 @@ const OFFICIAL_MODELS_DEV_PATTERNS: Array<{ provider: string; model: RegExp }> =
 ];
 
 export default async function (pi: ExtensionAPI) {
+	pi.on("session_start", (_event, ctx) => {
+		bindUiNotify((message, type) => ctx.ui.notify(message, type));
+	});
+
 	const providerModels = await loadProviderModels();
 
 	registerNewApiProvider(pi, providerModels.models);
@@ -376,6 +408,8 @@ export default async function (pi: ExtensionAPI) {
 	// cancel it on `session_shutdown` and never call `registerProvider` after that.
 	const refreshAbort = new AbortController();
 	pi.on("session_shutdown", () => {
+		uiNotify = undefined;
+		pendingNotifications.length = 0;
 		refreshAbort.abort();
 	});
 
@@ -428,8 +462,9 @@ async function refreshProviderModelsInBackground(
 		registerNewApiProvider(pi, models);
 	} catch (error) {
 		if (signal.aborted) return;
-		console.warn(
+		notify(
 			`[${PROVIDER_ID}] Failed to refresh model cache: ${error instanceof Error ? error.message : String(error)}`,
+			"warning",
 		);
 	}
 }
@@ -497,7 +532,7 @@ function addSessionIdHeader(options: SimpleStreamOptions | undefined): SimpleStr
 	const sessionId = options?.cacheRetention === "none" ? undefined : options?.sessionId;
 	if (!sessionId) {
 		if (DEBUG_SESSION_HEADERS) {
-			console.warn(`[${PROVIDER_ID}] No session id available for request; ${SESSION_ID_HEADER} was not injected.`);
+			notify(`[${PROVIDER_ID}] No session id available for request; ${SESSION_ID_HEADER} was not injected.`, "warning");
 		}
 		return options;
 	}
@@ -508,7 +543,7 @@ function addSessionIdHeader(options: SimpleStreamOptions | undefined): SimpleStr
 	};
 
 	if (DEBUG_SESSION_HEADERS) {
-		console.warn(`[${PROVIDER_ID}] Injected ${SESSION_ID_HEADER} for session ${sessionId}.`);
+		notify(`[${PROVIDER_ID}] Injected ${SESSION_ID_HEADER} for session ${sessionId}.`, "info");
 	}
 
 	return {
@@ -669,7 +704,7 @@ async function fetchNewApiModelIds(headers: Record<string, string>): Promise<str
 		const response = await fetch(`${getOpenAiBaseUrl()}/models`, { headers });
 
 		if (!response.ok) {
-			console.warn(`[${PROVIDER_ID}] Failed to fetch models: ${response.status} ${await response.text()}`);
+			notify(`[${PROVIDER_ID}] Failed to fetch models: ${response.status} ${await response.text()}`, "warning");
 			return undefined;
 		}
 
@@ -680,7 +715,10 @@ async function fetchNewApiModelIds(headers: Record<string, string>): Promise<str
 
 		return [...new Set(ids)].sort();
 	} catch (error) {
-		console.warn(`[${PROVIDER_ID}] Failed to fetch models: ${error instanceof Error ? error.message : String(error)}`);
+		notify(
+			`[${PROVIDER_ID}] Failed to fetch models: ${error instanceof Error ? error.message : String(error)}`,
+			"warning",
+		);
 		return undefined;
 	}
 }
@@ -729,7 +767,7 @@ function execConfigCommand(command: string): Promise<string | undefined> {
 	return new Promise((resolve) => {
 		exec(command, (error, stdout) => {
 			if (error) {
-				console.warn(`[${PROVIDER_ID}] Failed to resolve models.json command: ${error.message}`);
+				notify(`[${PROVIDER_ID}] Failed to resolve models.json command: ${error.message}`, "warning");
 				resolve(undefined);
 				return;
 			}
@@ -859,7 +897,10 @@ async function fetchPublicModelMetadataEntries(): Promise<PublicModelMetadataCac
 	try {
 		const response = await fetch(MODELS_DEV_URL);
 		if (!response.ok) {
-			console.warn(`[${PROVIDER_ID}] Failed to fetch public model metadata: ${response.status} ${response.statusText}`);
+			notify(
+				`[${PROVIDER_ID}] Failed to fetch public model metadata: ${response.status} ${response.statusText}`,
+				"warning",
+			);
 			return undefined;
 		}
 
@@ -881,8 +922,9 @@ async function fetchPublicModelMetadataEntries(): Promise<PublicModelMetadataCac
 
 		return entries;
 	} catch (error) {
-		console.warn(
+		notify(
 			`[${PROVIDER_ID}] Failed to fetch public model metadata: ${error instanceof Error ? error.message : String(error)}`,
+			"warning",
 		);
 		return undefined;
 	}
