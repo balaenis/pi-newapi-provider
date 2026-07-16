@@ -1,18 +1,23 @@
+// ABOUTME: Pi custom provider extension for NewAPI gateways.
+// ABOUTME: Discovers models, routes by backend API, and streams via pi-ai compat handlers.
+
 import { exec } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { AuthStorage, getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, readStoredCredential, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	type Api,
 	type AssistantMessageEventStream,
 	type Context,
+	type Credential,
 	createAssistantMessageEventStream,
 	getApiProvider,
 	type GoogleOptions,
 	type GoogleThinkingLevel,
 	type Model,
+	type RefreshModelsContext,
 	type SimpleStreamOptions,
 	streamSimple,
 } from "@earendil-works/pi-ai/compat";
@@ -126,6 +131,9 @@ interface CachedValueOptions<T> {
 	ttlMs: number;
 	readValue: (value: unknown) => T | undefined;
 	fetchValue: () => Promise<T | undefined>;
+	allowNetwork?: boolean;
+	force?: boolean;
+	signal?: AbortSignal;
 }
 
 interface CachedPublicModelMetadata {
@@ -135,21 +143,11 @@ interface CachedPublicModelMetadata {
 
 type PublicModelMetadataCacheValue = CachedPublicModelMetadata[];
 
-interface PublicModelMetadataLoadResult {
-	metadata: Map<string, PublicModelMetadata>;
-	shouldRefresh: boolean;
-}
-
-interface DiscoveredModelIdsLoadResult {
-	ids: string[];
-	shouldRefresh: boolean;
-}
-
-interface ProviderModelLoadResult {
-	models: NewApiModelConfig[];
-	publicModelMetadata: Map<string, PublicModelMetadata>;
-	discoveredModelIds: string[];
-	shouldRefresh: boolean;
+interface ModelLoadOptions {
+	allowNetwork?: boolean;
+	force?: boolean;
+	signal?: AbortSignal;
+	apiKey?: string;
 }
 
 interface NewApiDiscoverySource {
@@ -215,22 +213,27 @@ function readModelsJsonProviderConfig(providerId: string): ModelsJsonProviderCon
 }
 
 async function loadCachedValue<T>(options: CachedValueOptions<T>): Promise<CacheLoadResult<T>> {
+	const allowNetwork = options.allowNetwork !== false && MODEL_CACHE_REFRESH_MODE !== "off";
+	const force = options.force === true;
 	const cached = MODEL_CACHE_ENABLED ? readCacheValue(options) : undefined;
-	if (cached?.state === "fresh") return { value: cached.value, shouldRefresh: false };
 
-	if (cached?.state === "stale") {
-		if (MODEL_CACHE_REFRESH_MODE === "blocking") {
-			const value = await refreshCachedValue(options);
-			if (value !== undefined) return { value, shouldRefresh: false };
-		}
-
-		return {
-			value: cached.value,
-			shouldRefresh: MODEL_CACHE_REFRESH_MODE === "background",
-		};
+	if (!allowNetwork) {
+		return { value: cached?.value, shouldRefresh: false };
 	}
 
-	return { value: await refreshCachedValue(options), shouldRefresh: false };
+	if (!force && cached?.state === "fresh") {
+		return { value: cached.value, shouldRefresh: false };
+	}
+
+	if (options.signal?.aborted) {
+		return { value: cached?.value, shouldRefresh: false };
+	}
+
+	const value = await refreshCachedValue(options);
+	if (value !== undefined) return { value, shouldRefresh: false };
+
+	// Keep serving stale/fresh cache when a forced or background refresh fails.
+	return { value: cached?.value, shouldRefresh: false };
 }
 
 async function refreshCachedValue<T>(options: CachedValueOptions<T>): Promise<T | undefined> {
@@ -391,95 +394,71 @@ const OFFICIAL_MODELS_DEV_PATTERNS: Array<{ provider: string; model: RegExp }> =
 	{ provider: "xai", model: /^grok/i },
 ];
 
-export default async function (pi: ExtensionAPI) {
+export default function (pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => {
 		bindUiNotify((message, type) => ctx.ui.notify(message, type));
 	});
-
-	const providerModels = await loadProviderModels();
-
-	registerNewApiProvider(pi, providerModels.models);
-
-	if (!providerModels.shouldRefresh) return;
-
-	// The `pi` captured here goes stale when this extension instance is replaced
-	// (session switch, fork, reload). The new instance re-runs the factory with a
-	// fresh `pi`, so the old background refresh has nothing useful left to do —
-	// cancel it on `session_shutdown` and never call `registerProvider` after that.
-	const refreshAbort = new AbortController();
 	pi.on("session_shutdown", () => {
 		uiNotify = undefined;
 		pendingNotifications.length = 0;
-		refreshAbort.abort();
 	});
 
-	void refreshProviderModelsInBackground(
-		pi,
-		providerModels.publicModelMetadata,
-		providerModels.discoveredModelIds,
-		refreshAbort.signal,
-	);
-}
-
-async function loadProviderModels(): Promise<ProviderModelLoadResult> {
-	const publicModelMetadata = await loadPublicModelMetadata();
-	const discoveredModelIds = await loadDiscoveredModelIds();
-	const models =
-		discoveredModelIds.ids.length > 0
-			? modelsFromIds(discoveredModelIds.ids, publicModelMetadata.metadata)
-			: modelsFromEnvironment(publicModelMetadata.metadata);
-
-	return {
-		models,
-		publicModelMetadata: publicModelMetadata.metadata,
-		discoveredModelIds: discoveredModelIds.ids,
-		shouldRefresh: publicModelMetadata.shouldRefresh || discoveredModelIds.shouldRefresh,
-	};
-}
-
-async function refreshProviderModelsInBackground(
-	pi: ExtensionAPI,
-	currentPublicModelMetadata: Map<string, PublicModelMetadata>,
-	currentDiscoveredModelIds: string[],
-	signal: AbortSignal,
-): Promise<void> {
-	try {
-		const [publicModelMetadataEntries, discoveredModelIds] = await Promise.all([
-			refreshPublicModelMetadataCache(),
-			refreshDiscoveredModelIdsCache(),
-		]);
-
-		if (signal.aborted) return;
-		if (publicModelMetadataEntries === undefined && discoveredModelIds === undefined) return;
-
-		const publicModelMetadata = publicModelMetadataEntries
-			? toPublicModelMetadataMap(publicModelMetadataEntries)
-			: currentPublicModelMetadata;
-		const modelIds = discoveredModelIds ?? currentDiscoveredModelIds;
-		const models =
-			modelIds.length > 0 ? modelsFromIds(modelIds, publicModelMetadata) : modelsFromEnvironment(publicModelMetadata);
-
-		registerNewApiProvider(pi, models);
-	} catch (error) {
-		if (signal.aborted) return;
-		notify(
-			`[${PROVIDER_ID}] Failed to refresh model cache: ${error instanceof Error ? error.message : String(error)}`,
-			"warning",
-		);
-	}
-}
-
-function registerNewApiProvider(pi: ExtensionAPI, models: NewApiModelConfig[]): void {
+	// Register immediately from cache/env. Pi 0.80.8 calls refreshModels during
+	// ModelRuntime startup and later /model refreshes, so network discovery no
+	// longer needs a manual background re-register.
 	pi.registerProvider(PROVIDER_ID, {
 		name: PROVIDER_NAME,
 		baseUrl: getOpenAiBaseUrl(),
 		apiKey: PROVIDER_API_KEY,
 		api: NEWAPI_WRAPPER_API,
 		streamSimple: streamNewApiGateway,
+		models: loadInitialProviderModels(),
+		refreshModels: refreshNewApiModels,
 		...(Object.keys(EXTRA_HEADERS).length > 0 ? { headers: EXTRA_HEADERS } : {}),
 		...(AUTH_HEADER !== undefined ? { authHeader: AUTH_HEADER } : {}),
-		models,
 	});
+}
+
+function loadInitialProviderModels(): NewApiModelConfig[] {
+	const publicModelMetadata = loadPublicModelMetadataFromCache();
+	const discoveredModelIds = loadDiscoveredModelIdsFromCache();
+	return discoveredModelIds.length > 0
+		? modelsFromIds(discoveredModelIds, publicModelMetadata)
+		: modelsFromEnvironment(publicModelMetadata);
+}
+
+async function refreshNewApiModels(context: RefreshModelsContext): Promise<NewApiModelConfig[]> {
+	if (context.signal?.aborted) {
+		return loadInitialProviderModels();
+	}
+
+	const allowNetwork = context.allowNetwork && MODEL_CACHE_REFRESH_MODE !== "off";
+	const publicModelMetadata = await loadPublicModelMetadata({
+		allowNetwork,
+		force: context.force,
+		signal: context.signal,
+	});
+	const discoveredModelIds = await loadDiscoveredModelIds({
+		allowNetwork,
+		force: context.force,
+		signal: context.signal,
+		apiKey: apiKeyFromCredential(context.credential),
+	});
+
+	if (context.signal?.aborted) {
+		return loadInitialProviderModels();
+	}
+
+	return discoveredModelIds.length > 0
+		? modelsFromIds(discoveredModelIds, publicModelMetadata)
+		: modelsFromEnvironment(publicModelMetadata);
+}
+
+function apiKeyFromCredential(credential: Credential | undefined): string | undefined {
+	if (!credential) return undefined;
+	if (credential.type === "api_key") return credential.key;
+	if (credential.type === "oauth") return credential.access;
+	return undefined;
 }
 
 function streamNewApiGateway(
@@ -655,40 +634,45 @@ function getGemini25ThinkingBudget(modelId: string, reasoning: NonNullable<Simpl
 	return budgets[reasoning];
 }
 
-async function loadDiscoveredModelIds(): Promise<DiscoveredModelIdsLoadResult> {
-	if (process.env.NEWAPI_FETCH_MODELS === "false") return { ids: [], shouldRefresh: false };
+function loadDiscoveredModelIdsFromCache(): string[] {
+	if (process.env.NEWAPI_FETCH_MODELS === "false") return [];
 
-	const discoverySource = await getNewApiDiscoverySource();
-	if (!discoverySource) return { ids: [], shouldRefresh: false };
+	const discoverySource = getNewApiDiscoverySourceSync();
+	if (!discoverySource || !MODEL_CACHE_ENABLED) return [];
+
+	const cached = readCacheValue({
+		namespace: "models",
+		key: discoverySource.cacheKey,
+		ttlMs: MODELS_CACHE_TTL_MS,
+		readValue: readModelIdsCacheValue,
+		fetchValue: async () => undefined,
+	});
+
+	return cached?.value ?? [];
+}
+
+async function loadDiscoveredModelIds(options: ModelLoadOptions = {}): Promise<string[]> {
+	if (process.env.NEWAPI_FETCH_MODELS === "false") return [];
+
+	const discoverySource = await getNewApiDiscoverySource(options.apiKey);
+	if (!discoverySource) return [];
 
 	const result = await loadCachedValue({
 		namespace: "models",
 		key: discoverySource.cacheKey,
 		ttlMs: MODELS_CACHE_TTL_MS,
 		readValue: readModelIdsCacheValue,
-		fetchValue: () => fetchNewApiModelIds(discoverySource.headers),
+		fetchValue: () => fetchNewApiModelIds(discoverySource.headers, options.signal),
+		allowNetwork: options.allowNetwork,
+		force: options.force,
+		signal: options.signal,
 	});
 
-	return { ids: result.value ?? [], shouldRefresh: result.shouldRefresh };
+	return result.value ?? [];
 }
 
-async function refreshDiscoveredModelIdsCache(): Promise<string[] | undefined> {
-	if (process.env.NEWAPI_FETCH_MODELS === "false") return undefined;
-
-	const discoverySource = await getNewApiDiscoverySource();
-	if (!discoverySource) return undefined;
-
-	return await refreshCachedValue({
-		namespace: "models",
-		key: discoverySource.cacheKey,
-		ttlMs: MODELS_CACHE_TTL_MS,
-		readValue: readModelIdsCacheValue,
-		fetchValue: () => fetchNewApiModelIds(discoverySource.headers),
-	});
-}
-
-async function getNewApiDiscoverySource(): Promise<NewApiDiscoverySource | undefined> {
-	const apiKey = await getNewApiApiKey();
+async function getNewApiDiscoverySource(apiKeyHint?: string): Promise<NewApiDiscoverySource | undefined> {
+	const apiKey = apiKeyHint || (await getNewApiApiKey());
 	if (!apiKey) return undefined;
 
 	const headers = await getNewApiDiscoveryHeaders(apiKey);
@@ -699,9 +683,27 @@ async function getNewApiDiscoverySource(): Promise<NewApiDiscoverySource | undef
 	};
 }
 
-async function fetchNewApiModelIds(headers: Record<string, string>): Promise<string[] | undefined> {
+function getNewApiDiscoverySourceSync(): NewApiDiscoverySource | undefined {
+	const apiKey = getNewApiApiKeySync();
+	if (!apiKey) return undefined;
+
+	const headers = {
+		Authorization: `Bearer ${apiKey}`,
+		...(resolveHeadersSync(EXTRA_HEADERS) ?? {}),
+	};
+
+	return {
+		cacheKey: getNewApiDiscoveryCacheKey(apiKey, headers),
+		headers,
+	};
+}
+
+async function fetchNewApiModelIds(
+	headers: Record<string, string>,
+	signal?: AbortSignal,
+): Promise<string[] | undefined> {
 	try {
-		const response = await fetch(`${getOpenAiBaseUrl()}/models`, { headers });
+		const response = await fetch(`${getOpenAiBaseUrl()}/models`, { headers, signal });
 
 		if (!response.ok) {
 			notify(`[${PROVIDER_ID}] Failed to fetch models: ${response.status} ${await response.text()}`, "warning");
@@ -715,6 +717,7 @@ async function fetchNewApiModelIds(headers: Record<string, string>): Promise<str
 
 		return [...new Set(ids)].sort();
 	} catch (error) {
+		if (signal?.aborted) return undefined;
 		notify(
 			`[${PROVIDER_ID}] Failed to fetch models: ${error instanceof Error ? error.message : String(error)}`,
 			"warning",
@@ -727,9 +730,27 @@ async function getNewApiApiKey(): Promise<string | undefined> {
 	const configuredApiKey = await resolveConfigValue(MODELS_JSON_PROVIDER_CONFIG?.apiKey);
 	if (configuredApiKey) return configuredApiKey;
 
-	const authStorage = AuthStorage.create();
-	if (authStorage.has(PROVIDER_ID)) {
-		return await authStorage.getApiKey(PROVIDER_ID, { includeFallback: false });
+	// pi 0.80.8 removed AuthStorage exports; one-off auth.json reads use readStoredCredential.
+	const credential = readStoredCredential(PROVIDER_ID);
+	const storedKey = apiKeyFromCredential(credential);
+	if (storedKey) {
+		return (await resolveConfigValue(storedKey)) ?? storedKey;
+	}
+
+	return process.env.NEWAPI_API_KEY;
+}
+
+function getNewApiApiKeySync(): string | undefined {
+	const configuredApiKey = MODELS_JSON_PROVIDER_CONFIG?.apiKey;
+	if (configuredApiKey && !configuredApiKey.startsWith("!")) {
+		const resolved = resolveEnvironmentReferences(configuredApiKey);
+		if (resolved) return resolved;
+	}
+
+	const storedKey = apiKeyFromCredential(readStoredCredential(PROVIDER_ID));
+	if (storedKey) {
+		if (storedKey.startsWith("!")) return undefined;
+		return resolveEnvironmentReferences(storedKey) ?? storedKey;
 	}
 
 	return process.env.NEWAPI_API_KEY;
@@ -752,6 +773,21 @@ async function resolveHeaders(
 	);
 	const resolvedHeaders = Object.fromEntries(
 		resolvedEntries.filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+	);
+
+	return Object.keys(resolvedHeaders).length > 0 ? resolvedHeaders : undefined;
+}
+
+function resolveHeadersSync(headers: Record<string, string> | undefined): Record<string, string> | undefined {
+	if (!headers) return undefined;
+
+	const resolvedHeaders = Object.fromEntries(
+		Object.entries(headers)
+			.map(([key, value]) => {
+				if (value.startsWith("!")) return [key, undefined] as const;
+				return [key, resolveEnvironmentReferences(value)] as const;
+			})
+			.filter((entry): entry is [string, string] => typeof entry[1] === "string"),
 	);
 
 	return Object.keys(resolvedHeaders).length > 0 ? resolvedHeaders : undefined;
@@ -862,9 +898,27 @@ function toProviderModel(id: string, publicModelMetadata: Map<string, PublicMode
 	};
 }
 
-async function loadPublicModelMetadata(): Promise<PublicModelMetadataLoadResult> {
+function loadPublicModelMetadataFromCache(): Map<string, PublicModelMetadata> {
 	if (process.env.NEWAPI_FETCH_MODEL_METADATA === "false") {
-		return { metadata: new Map<string, PublicModelMetadata>(), shouldRefresh: false };
+		return new Map<string, PublicModelMetadata>();
+	}
+
+	const cached = MODEL_CACHE_ENABLED
+		? readCacheValue({
+				namespace: "metadata",
+				key: getPublicModelMetadataCacheKey(),
+				ttlMs: MODEL_METADATA_CACHE_TTL_MS,
+				readValue: readPublicModelMetadataCacheValue,
+				fetchValue: async () => undefined,
+			})
+		: undefined;
+
+	return toPublicModelMetadataMap(cached?.value ?? []);
+}
+
+async function loadPublicModelMetadata(options: ModelLoadOptions = {}): Promise<Map<string, PublicModelMetadata>> {
+	if (process.env.NEWAPI_FETCH_MODEL_METADATA === "false") {
+		return new Map<string, PublicModelMetadata>();
 	}
 
 	const result = await loadCachedValue({
@@ -872,30 +926,20 @@ async function loadPublicModelMetadata(): Promise<PublicModelMetadataLoadResult>
 		key: getPublicModelMetadataCacheKey(),
 		ttlMs: MODEL_METADATA_CACHE_TTL_MS,
 		readValue: readPublicModelMetadataCacheValue,
-		fetchValue: fetchPublicModelMetadataEntries,
+		fetchValue: () => fetchPublicModelMetadataEntries(options.signal),
+		allowNetwork: options.allowNetwork,
+		force: options.force,
+		signal: options.signal,
 	});
 
-	return {
-		metadata: toPublicModelMetadataMap(result.value ?? []),
-		shouldRefresh: result.shouldRefresh,
-	};
+	return toPublicModelMetadataMap(result.value ?? []);
 }
 
-async function refreshPublicModelMetadataCache(): Promise<PublicModelMetadataCacheValue | undefined> {
-	if (process.env.NEWAPI_FETCH_MODEL_METADATA === "false") return undefined;
-
-	return await refreshCachedValue({
-		namespace: "metadata",
-		key: getPublicModelMetadataCacheKey(),
-		ttlMs: MODEL_METADATA_CACHE_TTL_MS,
-		readValue: readPublicModelMetadataCacheValue,
-		fetchValue: fetchPublicModelMetadataEntries,
-	});
-}
-
-async function fetchPublicModelMetadataEntries(): Promise<PublicModelMetadataCacheValue | undefined> {
+async function fetchPublicModelMetadataEntries(
+	signal?: AbortSignal,
+): Promise<PublicModelMetadataCacheValue | undefined> {
 	try {
-		const response = await fetch(MODELS_DEV_URL);
+		const response = await fetch(MODELS_DEV_URL, { signal });
 		if (!response.ok) {
 			notify(
 				`[${PROVIDER_ID}] Failed to fetch public model metadata: ${response.status} ${response.statusText}`,
@@ -922,6 +966,7 @@ async function fetchPublicModelMetadataEntries(): Promise<PublicModelMetadataCac
 
 		return entries;
 	} catch (error) {
+		if (signal?.aborted) return undefined;
 		notify(
 			`[${PROVIDER_ID}] Failed to fetch public model metadata: ${error instanceof Error ? error.message : String(error)}`,
 			"warning",

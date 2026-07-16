@@ -47,7 +47,7 @@ Then select a model from the `newapi/...` provider in `/model`.
 
 On startup, the extension calls `GET <baseUrl>/v1/models` when an API key is available from `models.json`, `auth.json` for the provider id, or `NEWAPI_API_KEY`. If discovery fails, it falls back to `NEWAPI_MODELS`.
 
-If you save the API key with `/login` after pi has already started, restart pi or reload the extension to run model discovery again.
+If you save the API key with `/login`, pi refreshes configured providers (including this extension's `refreshModels`) so discovered models become available without a manual restart.
 
 ```bash
 export NEWAPI_MODELS="gpt-4o-mini,qwen3-coder"
@@ -58,10 +58,11 @@ export NEWAPI_FETCH_MODELS=false
 
 Model discovery cache is enabled by default to keep pi startup fast after the first successful discovery. Cache files are stored under `~/.pi/agent/cache/newapi-provider/`.
 
-- Fresh cache is used without calling the remote endpoint.
-- Stale cache is used immediately, then refreshed in the background.
-- After a successful background refresh, the extension re-registers the provider so the current pi session can see the refreshed model list.
-- If no usable cache exists, the extension fetches models during startup and falls back to `NEWAPI_MODELS` if discovery fails.
+- The extension registers immediately from cache/env models.
+- Pi 0.80.8+ calls provider `refreshModels` during ModelRuntime startup, after `/login`, and when refreshing models (for example via `/model` or `pi update --models`).
+- Fresh cache is reused without calling remote endpoints.
+- Stale or missing cache is refreshed during `refreshModels` when network access is allowed.
+- If discovery fails or is disabled, the extension falls back to `NEWAPI_MODELS`.
 
 Cache TTL values are seconds:
 
@@ -70,7 +71,7 @@ export NEWAPI_MODEL_CACHE=true
 export NEWAPI_MODELS_CACHE_TTL=1800          # /v1/models, 30 minutes
 export NEWAPI_MODEL_METADATA_CACHE_TTL=86400 # models.dev metadata, 24 hours
 export NEWAPI_MODEL_CACHE_STALE_TTL=604800   # stale cache usable up to 7 days
-export NEWAPI_MODEL_CACHE_REFRESH=background # background, blocking, or off
+export NEWAPI_MODEL_CACHE_REFRESH=background # background/blocking both refresh on demand; off disables network refresh
 ```
 
 Set `NEWAPI_MODEL_CACHE=false` to disable all local model cache reads and writes.
@@ -91,6 +92,6 @@ Set `NEWAPI_MODEL_CACHE=false` to disable all local model cache reads and writes
 - `NEWAPI_MODELS_CACHE_TTL` — fresh-cache TTL for NewAPI `/v1/models`, in seconds. Defaults to `1800`.
 - `NEWAPI_MODEL_METADATA_CACHE_TTL` — fresh-cache TTL for `models.dev` metadata, in seconds. Defaults to `86400`.
 - `NEWAPI_MODEL_CACHE_STALE_TTL` — maximum stale cache age, in seconds. Defaults to `604800`.
-- `NEWAPI_MODEL_CACHE_REFRESH` — stale-cache refresh behavior: `background` (default), `blocking`, or `off`.
+- `NEWAPI_MODEL_CACHE_REFRESH` — network refresh policy for `refreshModels`: `background`/`blocking` (default behavior, refresh when stale) or `off` (cache/env only).
 
 For per-model metadata, edit `toProviderModel()` in `index.ts`.
