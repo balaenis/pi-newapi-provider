@@ -1180,7 +1180,15 @@ function isGoogleModelId(id: string): boolean {
 }
 
 function supportsOpenAiResponsesApi(id: string): boolean {
-	return id.startsWith("openai/gpt-5") || id.startsWith("gpt-5") || /^openai\/o\d/.test(id) || /^o\d/.test(id);
+	return (
+		id.startsWith("openai/gpt-5") ||
+		id.startsWith("gpt-5") ||
+		/^openai\/o\d/.test(id) ||
+		/^o\d/.test(id) ||
+		// xAI grok-4.5 uses Responses API with reasoning.effort (not chat completions).
+		isGrok45ModelId(id) ||
+		isGrok420MultiAgentModelId(id)
+	);
 }
 
 function getModelCompat(
@@ -1229,8 +1237,40 @@ function getThinkingLevelMap(id: string, metadata: PublicModelMetadata | undefin
 		getGeminiThinkingLevelMap(candidates) ??
 		getClaudeThinkingLevelMap(candidates) ??
 		getOpenAiThinkingLevelMap(candidates) ??
+		getGrokThinkingLevelMap(candidates) ??
 		getKimiThinkingLevelMap(candidates)
 	);
+}
+
+function getGrokThinkingLevelMap(candidates: string[]): ThinkingLevelMap | undefined {
+	// xAI grok-4.5: reasoning.effort is low | medium | high (default high); cannot be disabled.
+	// See https://docs.x.ai/developers/model-capabilities/text/reasoning
+	if (candidates.some(isGrok45ModelId)) {
+		return {
+			off: null,
+			minimal: null,
+			low: "low",
+			medium: "medium",
+			high: "high",
+			xhigh: null,
+			max: null,
+		};
+	}
+
+	// grok-4.20-multi-agent uses effort to control agent count, including xhigh.
+	if (candidates.some(isGrok420MultiAgentModelId)) {
+		return {
+			off: null,
+			minimal: null,
+			low: "low",
+			medium: "medium",
+			high: "high",
+			xhigh: "xhigh",
+			max: null,
+		};
+	}
+
+	return undefined;
 }
 
 function getKimiThinkingLevelMap(candidates: string[]): ThinkingLevelMap | undefined {
@@ -1331,7 +1371,11 @@ function getMaxTokensField(candidates: string[]): MaxTokensField {
 
 function supportsReasoningEffort(candidates: string[]): boolean {
 	return (
-		candidates.some(isOpenAiReasoningModelId) || candidates.some(isDeepSeekModelId) || candidates.some(isGlmModelId)
+		candidates.some(isOpenAiReasoningModelId) ||
+		candidates.some(isDeepSeekModelId) ||
+		candidates.some(isGlmModelId) ||
+		candidates.some(isGrok45ModelId) ||
+		candidates.some(isGrok420MultiAgentModelId)
 	);
 }
 
@@ -1341,7 +1385,8 @@ function supportsThinking(id: string): boolean {
 		isDeepSeekModelId(id) ||
 		isGeminiThinkingModelId(id) ||
 		isClaudeThinkingModelId(id) ||
-		isGlmModelId(id)
+		isGlmModelId(id) ||
+		isGrokModelId(id)
 	);
 }
 
@@ -1400,6 +1445,18 @@ function usesMaxTokensField(id: string): boolean {
 
 function isKimiK3ModelId(id: string): boolean {
 	return id.startsWith("moonshotai/kimi-k3") || id.startsWith("kimi-k3");
+}
+
+function isGrokModelId(id: string): boolean {
+	return id.startsWith("xai/grok") || id.startsWith("grok");
+}
+
+function isGrok45ModelId(id: string): boolean {
+	return /^(?:xai\/)?grok-4\.5(?:$|[-_/])/i.test(id);
+}
+
+function isGrok420MultiAgentModelId(id: string): boolean {
+	return /^(?:xai\/)?grok-4\.20-multi-agent(?:$|[-_/])/i.test(id);
 }
 
 function isDeepSeekModelId(id: string): boolean {
