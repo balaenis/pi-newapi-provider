@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { getAgentDir, readStoredCredential, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, readStoredCredential, VERSION, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	type Api,
 	type AssistantMessageEventStream,
@@ -179,8 +179,13 @@ const DEFAULT_MAX_TOKENS = parsePositiveInteger(process.env.NEWAPI_MAX_TOKENS, 4
 const DEFAULT_REASONING = parseBoolean(process.env.NEWAPI_REASONING, false);
 const DEFAULT_INPUT = parseInputs(process.env.NEWAPI_INPUTS || "text");
 const SESSION_ID_HEADER = process.env.NEWAPI_SESSION_ID_HEADER?.trim() || "x-session-id";
+const USER_AGENT_HEADER = "User-Agent";
 const DEBUG_SESSION_HEADERS = parseBoolean(process.env.NEWAPI_DEBUG_SESSION_HEADERS, false);
+// Match official pi `getPiUserAgent`: pi/<version> (<platform>; <runtime>; <arch>)
+const DEFAULT_USER_AGENT = getPiUserAgent(VERSION);
 const EXTRA_HEADERS = MODELS_JSON_PROVIDER_CONFIG?.headers ?? parseHeaders(process.env.NEWAPI_HEADERS);
+// Provider-level headers applied to chat + discovery. Explicit User-Agent overrides the default.
+const PROVIDER_HEADERS = withDefaultUserAgent(EXTRA_HEADERS);
 const AUTH_HEADER = MODELS_JSON_PROVIDER_CONFIG?.authHeader;
 const ROUTES_BY_MODEL_ID = new Map<string, { api: NewApiBackendApi; baseUrl: string }>();
 
@@ -414,7 +419,7 @@ export default function (pi: ExtensionAPI) {
 		streamSimple: streamNewApiGateway,
 		models: loadInitialProviderModels(),
 		refreshModels: refreshNewApiModels,
-		...(Object.keys(EXTRA_HEADERS).length > 0 ? { headers: EXTRA_HEADERS } : {}),
+		headers: PROVIDER_HEADERS,
 		...(AUTH_HEADER !== undefined ? { authHeader: AUTH_HEADER } : {}),
 	});
 }
@@ -689,7 +694,7 @@ function getNewApiDiscoverySourceSync(): NewApiDiscoverySource | undefined {
 
 	const headers = {
 		Authorization: `Bearer ${apiKey}`,
-		...(resolveHeadersSync(EXTRA_HEADERS) ?? {}),
+		...(resolveHeadersSync(PROVIDER_HEADERS) ?? {}),
 	};
 
 	return {
@@ -759,7 +764,7 @@ function getNewApiApiKeySync(): string | undefined {
 async function getNewApiDiscoveryHeaders(apiKey: string): Promise<Record<string, string>> {
 	return {
 		Authorization: `Bearer ${apiKey}`,
-		...(await resolveHeaders(EXTRA_HEADERS)),
+		...(await resolveHeaders(PROVIDER_HEADERS)),
 	};
 }
 
@@ -939,7 +944,10 @@ async function fetchPublicModelMetadataEntries(
 	signal?: AbortSignal,
 ): Promise<PublicModelMetadataCacheValue | undefined> {
 	try {
-		const response = await fetch(MODELS_DEV_URL, { signal });
+		const response = await fetch(MODELS_DEV_URL, {
+			headers: { [USER_AGENT_HEADER]: DEFAULT_USER_AGENT },
+			signal,
+		});
 		if (!response.ok) {
 			notify(
 				`[${PROVIDER_ID}] Failed to fetch public model metadata: ${response.status} ${response.statusText}`,
@@ -1479,6 +1487,25 @@ function parseHeaders(value: string | undefined): Record<string, string> {
 	} catch {
 		return {};
 	}
+}
+
+/** Same format as pi-coding-agent's internal getPiUserAgent (not a public export). */
+function getPiUserAgent(version: string): string {
+	const runtime = process.versions.bun ? `bun/${process.versions.bun}` : `node/${process.version}`;
+	return `pi/${version} (${process.platform}; ${runtime}; ${process.arch})`;
+}
+
+function hasHeaderIgnoreCase(headers: Record<string, string>, name: string): boolean {
+	const target = name.toLowerCase();
+	return Object.keys(headers).some((key) => key.toLowerCase() === target);
+}
+
+function withDefaultUserAgent(headers: Record<string, string> | undefined): Record<string, string> {
+	const merged = { ...(headers ?? {}) };
+	if (!hasHeaderIgnoreCase(merged, USER_AGENT_HEADER)) {
+		merged[USER_AGENT_HEADER] = DEFAULT_USER_AGENT;
+	}
+	return merged;
 }
 
 function formatModelName(id: string): string {
