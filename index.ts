@@ -1,12 +1,18 @@
 // ABOUTME: Pi custom provider extension for NewAPI gateways.
 // ABOUTME: Discovers models, routes by backend API, and streams via pi-ai compat handlers.
 
-import { exec, execSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { getAgentDir, readStoredCredential, VERSION, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+	getAgentDir,
+	getShellConfig,
+	readStoredCredential,
+	VERSION,
+	type ExtensionAPI,
+} from "@earendil-works/pi-coding-agent";
 import {
 	type Api,
 	type AssistantMessageEventStream,
@@ -761,6 +767,7 @@ function getNewApiApiKeySync(): string | undefined {
 
 // Startup registration is synchronous and pi only re-refreshes extension providers with
 // allowNetwork:false afterwards, so !command secrets must resolve here for cache hits.
+// Match pi's resolveConfigValue: run !commands through getShellConfig (Git Bash on Windows).
 const COMMAND_CONFIG_TIMEOUT_MS = 10_000;
 const commandConfigCache = new Map<string, string | undefined>();
 
@@ -776,21 +783,44 @@ function execConfigCommandSync(commandConfig: string): string | undefined {
 		return commandConfigCache.get(commandConfig);
 	}
 
+	const value = runShellConfigCommand(commandConfig.slice(1));
+	commandConfigCache.set(commandConfig, value);
+	if (value === undefined) {
+		notify(`[${PROVIDER_ID}] Failed to resolve config command: ${commandConfig.slice(1)}`, "warning");
+	}
+	return value;
+}
+
+function runShellConfigCommand(command: string): string | undefined {
 	try {
-		const output = execSync(commandConfig.slice(1), {
+		const { shell, args, commandTransport } = getShellConfig();
+		const commandFromStdin = commandTransport === "stdin";
+		const result = spawnSync(shell, commandFromStdin ? args : [...args, command], {
+			encoding: "utf-8",
+			input: commandFromStdin ? command : undefined,
+			timeout: COMMAND_CONFIG_TIMEOUT_MS,
+			stdio: [commandFromStdin ? "pipe" : "ignore", "pipe", "ignore"],
+			shell: false,
+			windowsHide: true,
+		});
+
+		if (!result.error && result.status === 0) {
+			const output = (result.stdout ?? "").trim();
+			return output.length > 0 ? output : undefined;
+		}
+	} catch {
+		// Fall through to execSync below.
+	}
+
+	// Fallback for environments where getShellConfig is unavailable or fails.
+	try {
+		const output = execSync(command, {
 			encoding: "utf-8",
 			timeout: COMMAND_CONFIG_TIMEOUT_MS,
 			stdio: ["ignore", "pipe", "ignore"],
 		}).trim();
-		const value = output.length > 0 ? output : undefined;
-		commandConfigCache.set(commandConfig, value);
-		return value;
-	} catch (error) {
-		commandConfigCache.set(commandConfig, undefined);
-		notify(
-			`[${PROVIDER_ID}] Failed to resolve models.json command: ${error instanceof Error ? error.message : String(error)}`,
-			"warning",
-		);
+		return output.length > 0 ? output : undefined;
+	} catch {
 		return undefined;
 	}
 }
@@ -841,23 +871,8 @@ function resolveHeadersSync(headers: Record<string, string> | undefined): Record
 
 async function resolveConfigValue(value: string | undefined): Promise<string | undefined> {
 	if (!value) return undefined;
-	if (value.startsWith("!")) return await execConfigCommand(value.slice(1));
-	return resolveEnvironmentReferences(value);
-}
-
-function execConfigCommand(command: string): Promise<string | undefined> {
-	return new Promise((resolve) => {
-		exec(command, (error, stdout) => {
-			if (error) {
-				notify(`[${PROVIDER_ID}] Failed to resolve models.json command: ${error.message}`, "warning");
-				resolve(undefined);
-				return;
-			}
-
-			const value = stdout.trim();
-			resolve(value.length > 0 ? value : undefined);
-		});
-	});
+	// !command resolution is sync via the configured shell; keep one code path with caching.
+	return resolveConfigValueSync(value);
 }
 
 function resolveEnvironmentReferences(value: string): string | undefined {
