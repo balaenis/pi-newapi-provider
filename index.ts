@@ -1,7 +1,7 @@
 // ABOUTME: Pi custom provider extension for NewAPI gateways.
 // ABOUTME: Discovers models, routes by backend API, and streams via pi-ai compat handlers.
 
-import { exec } from "node:child_process";
+import { exec, execSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -692,10 +692,9 @@ function getNewApiDiscoverySourceSync(): NewApiDiscoverySource | undefined {
 	const apiKey = getNewApiApiKeySync();
 	if (!apiKey) return undefined;
 
-	const headers = {
-		Authorization: `Bearer ${apiKey}`,
-		...(resolveHeadersSync(PROVIDER_HEADERS) ?? {}),
-	};
+	// Discovery cache keys must stay stable across chat-only header defaults like User-Agent.
+	// Only auth + explicit provider headers affect which models the gateway returns.
+	const headers = buildNewApiDiscoveryHeaders(apiKey, resolveHeadersSync(EXTRA_HEADERS));
 
 	return {
 		cacheKey: getNewApiDiscoveryCacheKey(apiKey, headers),
@@ -747,24 +746,66 @@ async function getNewApiApiKey(): Promise<string | undefined> {
 
 function getNewApiApiKeySync(): string | undefined {
 	const configuredApiKey = MODELS_JSON_PROVIDER_CONFIG?.apiKey;
-	if (configuredApiKey && !configuredApiKey.startsWith("!")) {
-		const resolved = resolveEnvironmentReferences(configuredApiKey);
+	if (configuredApiKey) {
+		const resolved = resolveConfigValueSync(configuredApiKey);
 		if (resolved) return resolved;
 	}
 
 	const storedKey = apiKeyFromCredential(readStoredCredential(PROVIDER_ID));
 	if (storedKey) {
-		if (storedKey.startsWith("!")) return undefined;
-		return resolveEnvironmentReferences(storedKey) ?? storedKey;
+		return resolveConfigValueSync(storedKey) ?? (!storedKey.startsWith("!") ? storedKey : undefined);
 	}
 
 	return process.env.NEWAPI_API_KEY;
 }
 
+// Startup registration is synchronous and pi only re-refreshes extension providers with
+// allowNetwork:false afterwards, so !command secrets must resolve here for cache hits.
+const COMMAND_CONFIG_TIMEOUT_MS = 10_000;
+const commandConfigCache = new Map<string, string | undefined>();
+
+function resolveConfigValueSync(value: string): string | undefined {
+	if (value.startsWith("!")) {
+		return execConfigCommandSync(value);
+	}
+	return resolveEnvironmentReferences(value);
+}
+
+function execConfigCommandSync(commandConfig: string): string | undefined {
+	if (commandConfigCache.has(commandConfig)) {
+		return commandConfigCache.get(commandConfig);
+	}
+
+	try {
+		const output = execSync(commandConfig.slice(1), {
+			encoding: "utf-8",
+			timeout: COMMAND_CONFIG_TIMEOUT_MS,
+			stdio: ["ignore", "pipe", "ignore"],
+		}).trim();
+		const value = output.length > 0 ? output : undefined;
+		commandConfigCache.set(commandConfig, value);
+		return value;
+	} catch (error) {
+		commandConfigCache.set(commandConfig, undefined);
+		notify(
+			`[${PROVIDER_ID}] Failed to resolve models.json command: ${error instanceof Error ? error.message : String(error)}`,
+			"warning",
+		);
+		return undefined;
+	}
+}
+
 async function getNewApiDiscoveryHeaders(apiKey: string): Promise<Record<string, string>> {
+	return buildNewApiDiscoveryHeaders(apiKey, await resolveHeaders(EXTRA_HEADERS));
+}
+
+function buildNewApiDiscoveryHeaders(
+	apiKey: string,
+	extraHeaders: Record<string, string> | undefined,
+): Record<string, string> {
 	return {
 		Authorization: `Bearer ${apiKey}`,
-		...(await resolveHeaders(PROVIDER_HEADERS)),
+		...(extraHeaders ?? {}),
 	};
 }
 
