@@ -1164,8 +1164,24 @@ function getThinkingLevelMap(id: string, metadata: PublicModelMetadata | undefin
 	return (
 		getGeminiThinkingLevelMap(candidates) ??
 		getClaudeThinkingLevelMap(candidates) ??
-		getOpenAiThinkingLevelMap(candidates)
+		getOpenAiThinkingLevelMap(candidates) ??
+		getKimiThinkingLevelMap(candidates)
 	);
+}
+
+function getKimiThinkingLevelMap(candidates: string[]): ThinkingLevelMap | undefined {
+	if (candidates.some(isKimiK3ModelId)) {
+		return {
+			off: null,
+			minimal: null,
+			low: null,
+			medium: null,
+			high: null,
+			xhigh: null,
+			max: "max",
+		};
+		return undefined;
+	}
 }
 
 function getGeminiThinkingLevelMap(candidates: string[]): ThinkingLevelMap | undefined {
@@ -1316,6 +1332,10 @@ function usesMaxTokensField(id: string): boolean {
 		id.startsWith("deepseek/deepseek") ||
 		id.startsWith("deepseek")
 	);
+}
+
+function isKimiK3ModelId(id: string): boolean {
+	return id.startsWith("moonshotai/kimi-k3") || id.startsWith("kimi-k3");
 }
 
 function isDeepSeekModelId(id: string): boolean {
