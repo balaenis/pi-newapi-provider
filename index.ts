@@ -1335,7 +1335,7 @@ function getOpenAiThinkingLevelMap(candidates: string[]): ThinkingLevelMap | und
 	if (candidates.some(isGpt56ReasoningModelId)) {
 		return {
 			off: "none",
-			minimal: "minimal",
+			minimal: "null",
 			low: "low",
 			medium: "medium",
 			high: "high",
