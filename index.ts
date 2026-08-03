@@ -197,7 +197,7 @@ const DEBUG_SESSION_HEADERS = parseBoolean(process.env.NEWAPI_DEBUG_SESSION_HEAD
 // Match official pi `getPiUserAgent`: pi/<version> (<platform>; <runtime>; <arch>)
 const DEFAULT_USER_AGENT = getPiUserAgent(VERSION);
 const EXTRA_HEADERS = MODELS_JSON_PROVIDER_CONFIG?.headers ?? parseHeaders(process.env.NEWAPI_HEADERS);
-// Provider-level headers applied to chat + discovery. Explicit User-Agent overrides the default.
+// Provider-level headers are injected into chat requests. Explicit request headers override defaults.
 const PROVIDER_HEADERS = withDefaultUserAgent(EXTRA_HEADERS);
 const ROUTES_BY_MODEL_ID = new Map<string, { api: NewApiBackendApi; baseUrl: string }>();
 
@@ -561,7 +561,9 @@ function streamNewApiGateway(
 		try {
 			const route = ROUTES_BY_MODEL_ID.get(model.id) ?? getModelRoute(model.id, undefined);
 			const routedModel = { ...model, api: route.api, baseUrl: route.baseUrl };
-			const routedOptions = await addModelsJsonRequestAuth(addSessionIdHeader(options));
+			const sessionOptions = addSessionIdHeader(options);
+			const providerOptions = await addProviderRequestHeaders(sessionOptions);
+			const routedOptions = await addModelsJsonRequestAuth(providerOptions);
 			const innerStream = streamBackendApi(route.api, routedModel, context, routedOptions);
 
 			for await (const event of innerStream) stream.push(event);
@@ -594,6 +596,33 @@ function streamNewApiGateway(
 	})();
 
 	return stream;
+}
+
+async function addProviderRequestHeaders(options: SimpleStreamOptions | undefined): Promise<SimpleStreamOptions> {
+	const providerHeaders = withDefaultUserAgent(await resolveHeaders(EXTRA_HEADERS));
+	const headers = mergeRequestHeaders(providerHeaders, options?.headers);
+
+	return {
+		...(options ?? {}),
+		headers,
+	};
+}
+
+function mergeRequestHeaders(
+	defaults: Record<string, string>,
+	overrides: Record<string, string | null> | undefined,
+): Record<string, string | null> {
+	const merged: Record<string, string | null> = { ...defaults };
+
+	for (const [name, value] of Object.entries(overrides ?? {})) {
+		const lowerName = name.toLowerCase();
+		for (const existingName of Object.keys(merged)) {
+			if (existingName.toLowerCase() === lowerName) delete merged[existingName];
+		}
+		merged[name] = value;
+	}
+
+	return merged;
 }
 
 function addSessionIdHeader(options: SimpleStreamOptions | undefined): SimpleStreamOptions | undefined {
