@@ -39,13 +39,13 @@ You can also configure the matching provider in `~/.pi/agent/models.json`. Provi
 
 The extension only uses those `models.json` fields as provider parameter overrides; model discovery and model compatibility metadata still come from this extension.
 
-For the API key, you can also run `/login`, choose **Use an API key**, and select **NewAPI Gateway**. pi stores that credential in `~/.pi/agent/auth.json` under the provider id, `newapi` by default. API key priority is `models.json` provider config, then `auth.json`, then `NEWAPI_API_KEY`.
+For the API key and base URL, you can also run `/login`, choose **Use an API key**, and select **NewAPI Gateway**. pi prompts for the gateway API key and the gateway base URL, then stores both in `~/.pi/agent/auth.json` under the provider id, `newapi` by default. API key priority is `models.json` provider config, then `auth.json`, then `NEWAPI_API_KEY`. Base URL priority is `auth.json` (as entered at `/login`), then `models.json` provider `baseUrl`, then `NEWAPI_BASE_URL`, then `http://localhost:3000`.
 
 Then select a model from the `newapi/...` provider in `/model`.
 
 ## Model discovery
 
-On startup, the extension calls `GET <baseUrl>/v1/models` when an API key is available from `models.json`, `auth.json` for the provider id, or `NEWAPI_API_KEY`. If discovery fails, it falls back to `NEWAPI_MODELS`.
+On startup, the extension calls `GET <baseUrl>/v1/models` when an API key is available from `models.json`, `auth.json` for the provider id, or `NEWAPI_API_KEY`. `<baseUrl>` is resolved from `auth.json`, `models.json`, or `NEWAPI_BASE_URL` (see the `/login` section). If discovery fails, it falls back to `NEWAPI_MODELS`.
 
 If you save the API key with `/login`, pi refreshes configured providers (including this extension's `refreshModels`) so discovered models become available without a manual restart.
 
@@ -80,7 +80,7 @@ Set `NEWAPI_MODEL_CACHE=false` to disable all local model cache reads and writes
 
 - `NEWAPI_PROVIDER_ID` — provider id used in `/model` and `auth.json`. Defaults to `newapi`.
 - `NEWAPI_PROVIDER_NAME` — display name shown in pi. Defaults to `NewAPI Gateway`.
-- `NEWAPI_BASE_URL` — gateway base URL. Overridden by matching `models.json` provider `baseUrl`.
+- `NEWAPI_BASE_URL` — gateway base URL fallback. Overridden by a base URL saved with `/login` and by a matching `models.json` provider `baseUrl`.
 - `NEWAPI_API_KEY` — gateway API key fallback when neither matching `models.json` provider `apiKey` nor `auth.json` contains this provider id.
 - `NEWAPI_INPUTS` — comma-separated inputs: `text` or `text,image`.
 - `NEWAPI_REASONING` — set `true` if all configured models support reasoning.

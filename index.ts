@@ -15,6 +15,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import {
 	type Api,
+	type ApiKeyAuth,
 	type AssistantMessageEventStream,
 	type Context,
 	type Credential,
@@ -65,8 +66,9 @@ function bindUiNotify(notifyFn: NotifyFn): void {
 interface NewApiModelConfig {
 	id: string;
 	name: string;
-	api?: NewApiModelApi;
-	baseUrl?: string;
+	provider: string;
+	api: NewApiModelApi;
+	baseUrl: string;
 	thinkingLevelMap?: ThinkingLevelMap;
 	reasoning: boolean;
 	input: ModelInput[];
@@ -154,11 +156,13 @@ interface ModelLoadOptions {
 	force?: boolean;
 	signal?: AbortSignal;
 	apiKey?: string;
+	baseUrl?: string;
 }
 
 interface NewApiDiscoverySource {
 	cacheKey: string;
 	headers: Record<string, string>;
+	baseUrl: string;
 }
 
 const NEWAPI_WRAPPER_API = "newapi-gateway" as const;
@@ -169,7 +173,10 @@ const BASE_URL = normalizeGatewayBaseUrl(
 	MODELS_JSON_PROVIDER_CONFIG?.baseUrl ?? process.env.NEWAPI_BASE_URL ?? "http://localhost:3000",
 );
 const MODELS_DEV_URL = process.env.NEWAPI_MODELS_DEV_URL?.trim() || "https://models.dev/models.json";
-const PROVIDER_API_KEY = MODELS_JSON_PROVIDER_CONFIG?.apiKey ?? "$NEWAPI_API_KEY";
+// Credential env key holding the base URL entered at /login; the ambient env
+// names mirror it so auth.json and environment configuration stay in sync.
+const NEWAPI_BASE_URL_ENV_NAME = "NEWAPI_BASE_URL";
+const NEWAPI_API_KEY_ENV_NAME = "NEWAPI_API_KEY";
 const MODEL_CACHE_VERSION = 1;
 const MODEL_CACHE_ENABLED = parseBoolean(process.env.NEWAPI_MODEL_CACHE, true);
 const MODEL_CACHE_DIR = join(getAgentDir(), "cache", "newapi-provider");
@@ -192,8 +199,13 @@ const DEFAULT_USER_AGENT = getPiUserAgent(VERSION);
 const EXTRA_HEADERS = MODELS_JSON_PROVIDER_CONFIG?.headers ?? parseHeaders(process.env.NEWAPI_HEADERS);
 // Provider-level headers applied to chat + discovery. Explicit User-Agent overrides the default.
 const PROVIDER_HEADERS = withDefaultUserAgent(EXTRA_HEADERS);
-const AUTH_HEADER = MODELS_JSON_PROVIDER_CONFIG?.authHeader;
 const ROUTES_BY_MODEL_ID = new Map<string, { api: NewApiBackendApi; baseUrl: string }>();
+
+// Effective gateway base URL, refreshed whenever a stored or refresh credential
+// is observed so a base URL entered at /login also applies to sync startup paths.
+let activeGatewayBaseUrl: string = BASE_URL;
+// Latest provider model catalog published through getModels().
+let currentModels: NewApiModelConfig[] = [];
 
 function readModelsJsonProviderConfig(providerId: string): ModelsJsonProviderConfig | undefined {
 	const modelsPath = join(getAgentDir(), "models.json");
@@ -307,10 +319,10 @@ function getPublicModelMetadataCacheKey(): string {
 	return stableStringify({ url: MODELS_DEV_URL });
 }
 
-function getNewApiDiscoveryCacheKey(apiKey: string, headers: Record<string, string>): string {
+function getNewApiDiscoveryCacheKey(apiKey: string, headers: Record<string, string>, baseUrl: string): string {
 	return stableStringify({
 		providerId: PROVIDER_ID,
-		baseUrl: getOpenAiBaseUrl(),
+		baseUrl: getOpenAiBaseUrl(baseUrl),
 		apiKeyHash: hashValue(apiKey),
 		headersHash: hashValue(stableStringify(headers)),
 	});
@@ -415,34 +427,42 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// Register immediately from cache/env. Pi 0.80.8 calls refreshModels during
-	// ModelRuntime startup and later /model refreshes, so network discovery no
-	// longer needs a manual background re-register.
-	pi.registerProvider(PROVIDER_ID, {
+	// ModelRuntime startup, after /login, and on /model refreshes, so network
+	// discovery no longer needs a manual background re-register. The full
+	// Provider form keeps the custom auth below, whose /login flow also asks
+	// for the gateway base URL (stored in the credential env).
+	currentModels = loadInitialProviderModels();
+
+	pi.registerProvider({
+		id: PROVIDER_ID,
 		name: PROVIDER_NAME,
 		baseUrl: getOpenAiBaseUrl(),
-		apiKey: PROVIDER_API_KEY,
-		api: NEWAPI_WRAPPER_API,
-		streamSimple: streamNewApiGateway,
-		models: loadInitialProviderModels(),
-		refreshModels: refreshNewApiModels,
 		headers: PROVIDER_HEADERS,
-		...(AUTH_HEADER !== undefined ? { authHeader: AUTH_HEADER } : {}),
+		auth: { apiKey: createNewApiApiKeyAuth() },
+		getModels: () => currentModels,
+		refreshModels: refreshNewApiModels,
+		stream: (model, context, options) =>
+			streamNewApiGateway(model, context, options as SimpleStreamOptions | undefined),
+		streamSimple: streamNewApiGateway,
 	});
 }
 
 function loadInitialProviderModels(): NewApiModelConfig[] {
+	activeGatewayBaseUrl = resolveGatewayBaseUrl(getStoredCredentialBaseUrl());
 	const publicModelMetadata = loadPublicModelMetadataFromCache();
-	const discoveredModelIds = loadDiscoveredModelIdsFromCache();
+	const discoveredModelIds = loadDiscoveredModelIdsFromCache(activeGatewayBaseUrl);
 	return discoveredModelIds.length > 0
-		? modelsFromIds(discoveredModelIds, publicModelMetadata)
-		: modelsFromEnvironment(publicModelMetadata);
+		? modelsFromIds(discoveredModelIds, publicModelMetadata, activeGatewayBaseUrl)
+		: modelsFromEnvironment(publicModelMetadata, activeGatewayBaseUrl);
 }
 
-async function refreshNewApiModels(context: RefreshModelsContext): Promise<NewApiModelConfig[]> {
+async function refreshNewApiModels(context: RefreshModelsContext): Promise<void> {
 	if (context.signal?.aborted) {
-		return loadInitialProviderModels();
+		currentModels = loadInitialProviderModels();
+		return;
 	}
 
+	activeGatewayBaseUrl = resolveGatewayBaseUrl(credentialBaseUrl(context.credential));
 	const allowNetwork = context.allowNetwork && MODEL_CACHE_REFRESH_MODE !== "off";
 	const publicModelMetadata = await loadPublicModelMetadata({
 		allowNetwork,
@@ -454,15 +474,18 @@ async function refreshNewApiModels(context: RefreshModelsContext): Promise<NewAp
 		force: context.force,
 		signal: context.signal,
 		apiKey: apiKeyFromCredential(context.credential),
+		baseUrl: activeGatewayBaseUrl,
 	});
 
 	if (context.signal?.aborted) {
-		return loadInitialProviderModels();
+		currentModels = loadInitialProviderModels();
+		return;
 	}
 
-	return discoveredModelIds.length > 0
-		? modelsFromIds(discoveredModelIds, publicModelMetadata)
-		: modelsFromEnvironment(publicModelMetadata);
+	currentModels =
+		discoveredModelIds.length > 0
+			? modelsFromIds(discoveredModelIds, publicModelMetadata, activeGatewayBaseUrl)
+			: modelsFromEnvironment(publicModelMetadata, activeGatewayBaseUrl);
 }
 
 function apiKeyFromCredential(credential: Credential | undefined): string | undefined {
@@ -470,6 +493,61 @@ function apiKeyFromCredential(credential: Credential | undefined): string | unde
 	if (credential.type === "api_key") return credential.key;
 	if (credential.type === "oauth") return credential.access;
 	return undefined;
+}
+
+function credentialBaseUrl(credential: Credential | undefined): string | undefined {
+	const value = credential?.type === "api_key" ? credential.env?.[NEWAPI_BASE_URL_ENV_NAME] : undefined;
+	return typeof value === "string" && value.trim() ? normalizeGatewayBaseUrl(value) : undefined;
+}
+
+function getStoredCredentialBaseUrl(): string | undefined {
+	return credentialBaseUrl(readStoredCredential(PROVIDER_ID));
+}
+
+// Base URL precedence: /login credential env, then models.json baseUrl, then
+// NEWAPI_BASE_URL, then the default (BASE_URL already folds the latter three).
+function resolveGatewayBaseUrl(credentialBaseUrlHint: string | undefined): string {
+	return normalizeGatewayBaseUrl(credentialBaseUrlHint ?? BASE_URL);
+}
+
+function createNewApiApiKeyAuth(): ApiKeyAuth {
+	return {
+		name: "NewAPI Gateway API key",
+		async login(interaction) {
+			const apiKey = (await interaction.prompt({ type: "secret", message: "NewAPI Gateway API key" })).trim();
+			const enteredBaseUrl = (
+				await interaction.prompt({
+					type: "text",
+					message: "NewAPI Gateway base URL",
+					placeholder: getStoredCredentialBaseUrl() ?? BASE_URL,
+				})
+			).trim();
+
+			return {
+				type: "api_key",
+				key: apiKey || undefined,
+				env: { [NEWAPI_BASE_URL_ENV_NAME]: resolveGatewayBaseUrl(enteredBaseUrl || undefined) },
+			};
+		},
+		async check({ ctx, credential }) {
+			if (credential?.key || credentialBaseUrl(credential) || (await ctx.env(NEWAPI_API_KEY_ENV_NAME))) {
+				return { type: "api_key", source: credential ? "stored credential" : NEWAPI_API_KEY_ENV_NAME };
+			}
+			return undefined;
+		},
+		async resolve({ ctx, credential }) {
+			const storedBaseUrl = credentialBaseUrl(credential);
+			const apiKey = credential?.key || (await ctx.env(NEWAPI_API_KEY_ENV_NAME));
+			if (!apiKey && !storedBaseUrl) return undefined;
+
+			const baseUrl = resolveGatewayBaseUrl(storedBaseUrl);
+			return {
+				auth: { ...(apiKey ? { apiKey } : {}), baseUrl },
+				env: { ...(credential?.env ?? {}), [NEWAPI_BASE_URL_ENV_NAME]: baseUrl },
+				source: credential ? "stored credential" : NEWAPI_API_KEY_ENV_NAME,
+			};
+		},
+	};
 }
 
 function streamNewApiGateway(
@@ -645,10 +723,10 @@ function getGemini25ThinkingBudget(modelId: string, reasoning: NonNullable<Simpl
 	return budgets[reasoning];
 }
 
-function loadDiscoveredModelIdsFromCache(): string[] {
+function loadDiscoveredModelIdsFromCache(baseUrl: string): string[] {
 	if (process.env.NEWAPI_FETCH_MODELS === "false") return [];
 
-	const discoverySource = getNewApiDiscoverySourceSync();
+	const discoverySource = getNewApiDiscoverySourceSync(baseUrl);
 	if (!discoverySource || !MODEL_CACHE_ENABLED) return [];
 
 	const cached = readCacheValue({
@@ -665,7 +743,8 @@ function loadDiscoveredModelIdsFromCache(): string[] {
 async function loadDiscoveredModelIds(options: ModelLoadOptions = {}): Promise<string[]> {
 	if (process.env.NEWAPI_FETCH_MODELS === "false") return [];
 
-	const discoverySource = await getNewApiDiscoverySource(options.apiKey);
+	const baseUrl = resolveGatewayBaseUrl(options.baseUrl);
+	const discoverySource = await getNewApiDiscoverySource(options.apiKey, baseUrl);
 	if (!discoverySource) return [];
 
 	const result = await loadCachedValue({
@@ -673,7 +752,7 @@ async function loadDiscoveredModelIds(options: ModelLoadOptions = {}): Promise<s
 		key: discoverySource.cacheKey,
 		ttlMs: MODELS_CACHE_TTL_MS,
 		readValue: readModelIdsCacheValue,
-		fetchValue: () => fetchNewApiModelIds(discoverySource.headers, options.signal),
+		fetchValue: () => fetchNewApiModelIds(discoverySource.headers, discoverySource.baseUrl, options.signal),
 		allowNetwork: options.allowNetwork,
 		force: options.force,
 		signal: options.signal,
@@ -682,38 +761,46 @@ async function loadDiscoveredModelIds(options: ModelLoadOptions = {}): Promise<s
 	return result.value ?? [];
 }
 
-async function getNewApiDiscoverySource(apiKeyHint?: string): Promise<NewApiDiscoverySource | undefined> {
+async function getNewApiDiscoverySource(
+	apiKeyHint?: string,
+	baseUrlHint?: string,
+): Promise<NewApiDiscoverySource | undefined> {
 	const apiKey = apiKeyHint || (await getNewApiApiKey());
 	if (!apiKey) return undefined;
 
 	const headers = await getNewApiDiscoveryHeaders(apiKey);
+	const baseUrl = resolveGatewayBaseUrl(baseUrlHint);
 
 	return {
-		cacheKey: getNewApiDiscoveryCacheKey(apiKey, headers),
+		cacheKey: getNewApiDiscoveryCacheKey(apiKey, headers, baseUrl),
 		headers,
+		baseUrl,
 	};
 }
 
-function getNewApiDiscoverySourceSync(): NewApiDiscoverySource | undefined {
+function getNewApiDiscoverySourceSync(baseUrlHint: string): NewApiDiscoverySource | undefined {
 	const apiKey = getNewApiApiKeySync();
 	if (!apiKey) return undefined;
 
 	// Discovery cache keys must stay stable across chat-only header defaults like User-Agent.
 	// Only auth + explicit provider headers affect which models the gateway returns.
 	const headers = buildNewApiDiscoveryHeaders(apiKey, resolveHeadersSync(EXTRA_HEADERS));
+	const baseUrl = resolveGatewayBaseUrl(baseUrlHint);
 
 	return {
-		cacheKey: getNewApiDiscoveryCacheKey(apiKey, headers),
+		cacheKey: getNewApiDiscoveryCacheKey(apiKey, headers, baseUrl),
 		headers,
+		baseUrl,
 	};
 }
 
 async function fetchNewApiModelIds(
 	headers: Record<string, string>,
+	baseUrl: string,
 	signal?: AbortSignal,
 ): Promise<string[] | undefined> {
 	try {
-		const response = await fetch(`${getOpenAiBaseUrl()}/models`, { headers, signal });
+		const response = await fetch(`${getOpenAiBaseUrl(baseUrl)}/models`, { headers, signal });
 
 		if (!response.ok) {
 			notify(`[${PROVIDER_ID}] Failed to fetch models: ${response.status} ${await response.text()}`, "warning");
@@ -921,23 +1008,34 @@ function resolveEnvironmentReferences(value: string): string | undefined {
 	return resolved;
 }
 
-function modelsFromEnvironment(publicModelMetadata: Map<string, PublicModelMetadata>): NewApiModelConfig[] {
+function modelsFromEnvironment(
+	publicModelMetadata: Map<string, PublicModelMetadata>,
+	baseUrl: string,
+): NewApiModelConfig[] {
 	const ids = (process.env.NEWAPI_MODELS || "gpt-4o-mini")
 		.split(",")
 		.map((id) => id.trim())
 		.filter((id) => id.length > 0);
 
-	return modelsFromIds(ids, publicModelMetadata);
+	return modelsFromIds(ids, publicModelMetadata, baseUrl);
 }
 
-function modelsFromIds(ids: string[], publicModelMetadata: Map<string, PublicModelMetadata>): NewApiModelConfig[] {
+function modelsFromIds(
+	ids: string[],
+	publicModelMetadata: Map<string, PublicModelMetadata>,
+	baseUrl: string,
+): NewApiModelConfig[] {
 	ROUTES_BY_MODEL_ID.clear();
-	return [...new Set(ids)].map((id) => toProviderModel(id, publicModelMetadata));
+	return [...new Set(ids)].map((id) => toProviderModel(id, publicModelMetadata, baseUrl));
 }
 
-function toProviderModel(id: string, publicModelMetadata: Map<string, PublicModelMetadata>): NewApiModelConfig {
+function toProviderModel(
+	id: string,
+	publicModelMetadata: Map<string, PublicModelMetadata>,
+	baseUrl: string,
+): NewApiModelConfig {
 	const metadata = findPublicModelMetadata(id, publicModelMetadata);
-	const route = getModelRoute(id, metadata);
+	const route = getModelRoute(id, metadata, baseUrl);
 	ROUTES_BY_MODEL_ID.set(id, route);
 	const candidates = getModelRouteCandidates(id, metadata);
 	const reasoning = metadata?.reasoning ?? (DEFAULT_REASONING || candidates.some(supportsThinking));
@@ -947,6 +1045,7 @@ function toProviderModel(id: string, publicModelMetadata: Map<string, PublicMode
 	return {
 		id,
 		name: metadata?.name ?? formatModelName(id),
+		provider: PROVIDER_ID,
 		api: NEWAPI_WRAPPER_API,
 		baseUrl: route.baseUrl,
 		...(thinkingLevelMap ? { thinkingLevelMap } : {}),
@@ -1137,22 +1236,24 @@ function parsePublicModelInputs(value: unknown): ModelInput[] | undefined {
 function getModelRoute(
 	id: string,
 	metadata: PublicModelMetadata | undefined,
+	baseUrlOverride?: string,
 ): { api: NewApiBackendApi; baseUrl: string } {
 	const candidates = getModelRouteCandidates(id, metadata);
+	const gatewayBaseUrl = baseUrlOverride ?? activeGatewayBaseUrl;
 
 	if (candidates.some(isClaudeModelId)) {
-		return { api: "anthropic-messages", baseUrl: BASE_URL };
+		return { api: "anthropic-messages", baseUrl: gatewayBaseUrl };
 	}
 
 	if (candidates.some(isGoogleModelId)) {
-		return { api: "google-generative-ai", baseUrl: getGatewayBaseUrl("v1beta") };
+		return { api: "google-generative-ai", baseUrl: getGatewayBaseUrl("v1beta", gatewayBaseUrl) };
 	}
 
 	if (candidates.some(supportsOpenAiResponsesApi)) {
-		return { api: "openai-responses", baseUrl: getOpenAiBaseUrl() };
+		return { api: "openai-responses", baseUrl: getOpenAiBaseUrl(gatewayBaseUrl) };
 	}
 
-	return { api: "openai-completions", baseUrl: getOpenAiBaseUrl() };
+	return { api: "openai-completions", baseUrl: getOpenAiBaseUrl(gatewayBaseUrl) };
 }
 
 function getModelRouteCandidates(id: string, metadata: PublicModelMetadata | undefined): string[] {
@@ -1557,12 +1658,12 @@ function getClaudeVersion(
 	};
 }
 
-function getOpenAiBaseUrl(): string {
-	return getGatewayBaseUrl("v1");
+function getOpenAiBaseUrl(baseUrl: string = activeGatewayBaseUrl): string {
+	return getGatewayBaseUrl("v1", baseUrl);
 }
 
-function getGatewayBaseUrl(path: string): string {
-	return `${BASE_URL}/${path.replace(/^\/+/, "")}`;
+function getGatewayBaseUrl(path: string, baseUrl: string = activeGatewayBaseUrl): string {
+	return `${baseUrl}/${path.replace(/^\/+/, "")}`;
 }
 
 function normalizeGatewayBaseUrl(value: string): string {
