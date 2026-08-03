@@ -1309,7 +1309,7 @@ function getGeminiThinkingLevelMap(candidates: string[]): ThinkingLevelMap | und
 }
 
 function getClaudeThinkingLevelMap(candidates: string[]): ThinkingLevelMap | undefined {
-	if (candidates.some(isClaudeOpus47OrLaterModelId)) {
+	if (candidates.some(isClaudeOpus47OrLaterModelId) || candidates.some(isClaudeSonnet5OrLaterModelId)) {
 		return { minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" };
 	}
 	if (candidates.some(isClaudeAdaptiveMaxModelId)) {
@@ -1513,12 +1513,20 @@ function usesClaudeAdaptiveThinking(id: string): boolean {
 
 function isClaudeAdaptiveTemperatureUnsupported(id: string): boolean {
 	const version = getClaudeVersion(id);
-	return id.includes("claude-mythos") || !!(version?.family === "opus" && version.major === 4 && version.minor >= 7);
+	return (
+		id.includes("claude-mythos") ||
+		!!(version?.family === "opus" && (version.major > 4 || (version.major === 4 && version.minor >= 7)))
+	);
 }
 
 function isClaudeOpus47OrLaterModelId(id: string): boolean {
 	const version = getClaudeVersion(id);
-	return !!(version?.family === "opus" && version.major === 4 && version.minor >= 7);
+	return !!(version?.family === "opus" && (version.major > 4 || (version.major === 4 && version.minor >= 7)));
+}
+
+function isClaudeSonnet5OrLaterModelId(id: string): boolean {
+	const version = getClaudeVersion(id);
+	return !!(version?.family === "sonnet" && version.major > 4);
 }
 
 function isClaudeAdaptiveMaxModelId(id: string): boolean {
