@@ -119,7 +119,6 @@ type CacheState = "fresh" | "stale";
 
 interface CacheLoadResult<T> {
 	value?: T;
-	shouldRefresh: boolean;
 }
 
 interface CacheReadResult<T> {
@@ -242,22 +241,22 @@ async function loadCachedValue<T>(options: CachedValueOptions<T>): Promise<Cache
 	const cached = MODEL_CACHE_ENABLED ? readCacheValue(options) : undefined;
 
 	if (!allowNetwork) {
-		return { value: cached?.value, shouldRefresh: false };
+		return { value: cached?.value };
 	}
 
 	if (!force && cached?.state === "fresh") {
-		return { value: cached.value, shouldRefresh: false };
+		return { value: cached.value };
 	}
 
 	if (options.signal?.aborted) {
-		return { value: cached?.value, shouldRefresh: false };
+		return { value: cached?.value };
 	}
 
 	const value = await refreshCachedValue(options);
-	if (value !== undefined) return { value, shouldRefresh: false };
+	if (value !== undefined) return { value };
 
 	// Keep serving stale/fresh cache when a forced or background refresh fails.
-	return { value: cached?.value, shouldRefresh: false };
+	return { value: cached?.value };
 }
 
 async function refreshCachedValue<T>(options: CachedValueOptions<T>): Promise<T | undefined> {
@@ -1480,8 +1479,8 @@ function getKimiThinkingLevelMap(candidates: string[]): ThinkingLevelMap | undef
 			xhigh: null,
 			max: "max",
 		};
-		return undefined;
 	}
+	return undefined;
 }
 
 function getGeminiThinkingLevelMap(candidates: string[]): ThinkingLevelMap | undefined {
