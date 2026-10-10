@@ -62,8 +62,10 @@ The extension reads model facts and official provider reasoning options from
 - Effort values with the same pi name map directly: `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`.
 - Missing levels map to `null`. Unknown values do not enable a pi level.
 - The provider value `none` maps to pi's `off`.
-- Token budgets, including Gemini 2.5 Pro budgets, keep their existing hardcoded mappings.
-- Models without effort data keep their existing hardcoded mappings. Toggle and budget controls are not treated as effort lists.
+- Gemini named effort levels come only from official provider data. Missing effort data disables those levels; model names do not supply a fallback.
+- Google requests use the installed effort map. They reject unsupported levels instead of converting them by model name.
+- Explicit effort data takes precedence over Gemini-specific conversions. Gemini 2.5 token budgets remain a fallback when effort data is absent. The model map and request configuration use the same budget values.
+- Other model families without effort data keep their existing hardcoded mappings. Toggle and budget controls are not treated as effort lists.
 - The local metadata cache stores the effort values for offline startup.
 
 `NEWAPI_MODELS_DEV_URL` can override the catalog URL. The parser also accepts the legacy flat `models.json` format and provider-only `api.json`. A flat model-only source does not supply effort values.

@@ -697,48 +697,42 @@ function streamNewApiGoogle(
 
 	return provider.stream(model, context, {
 		...options,
-		thinking: getGoogleThinkingConfig(model.id, options?.reasoning),
+		thinking: getGoogleThinkingConfig(model, options?.reasoning),
 	} as GoogleOptions);
 }
 
-function getGoogleThinkingConfig(
-	modelId: string,
+const GOOGLE_THINKING_LEVELS: Partial<Record<string, GoogleThinkingLevel>> = {
+	minimal: "MINIMAL",
+	low: "LOW",
+	medium: "MEDIUM",
+	high: "HIGH",
+	// Retain non-name conversions for efforts beyond Google's highest API enum.
+	xhigh: "HIGH",
+	max: "HIGH",
+};
+
+export function getGoogleThinkingConfig(
+	model: Pick<Model<"google-generative-ai">, "id" | "thinkingLevelMap">,
 	reasoning: SimpleStreamOptions["reasoning"] | undefined,
 ): { enabled: boolean; budgetTokens?: number; level?: GoogleThinkingLevel } {
 	if (!reasoning) {
-		return isGemini25ProModelId(modelId) ? { enabled: true, budgetTokens: 128 } : { enabled: false };
+		return isGemini25ProModelId(model.id)
+			? { enabled: true, budgetTokens: getGemini25ThinkingBudget(model.id, "minimal") }
+			: { enabled: false };
 	}
 
-	if (isGemini25ModelId(modelId)) {
-		return { enabled: true, budgetTokens: getGemini25ThinkingBudget(modelId, reasoning) };
+	const effort = model.thinkingLevelMap?.[reasoning];
+	const level = effort ? GOOGLE_THINKING_LEVELS[effort] : undefined;
+	if (level) return { enabled: true, level };
+
+	if (isGemini25ModelId(model.id)) {
+		const budgetTokens = effort === undefined ? getGemini25ThinkingBudget(model.id, reasoning) : Number(effort);
+		if (effort !== null && Number.isInteger(budgetTokens) && budgetTokens > 0) {
+			return { enabled: true, budgetTokens };
+		}
 	}
 
-	return { enabled: true, level: getGeminiThinkingLevel(modelId, reasoning) };
-}
-
-function getGeminiThinkingLevel(
-	modelId: string,
-	reasoning: NonNullable<SimpleStreamOptions["reasoning"]>,
-): GoogleThinkingLevel {
-	if (isGemini31ProModelId(modelId)) {
-		return reasoning === "low" ? "LOW" : reasoning === "medium" ? "MEDIUM" : "HIGH";
-	}
-	if (isGemini3ProModelId(modelId)) {
-		return reasoning === "low" ? "LOW" : "HIGH";
-	}
-
-	switch (reasoning) {
-		case "minimal":
-			return "MINIMAL";
-		case "low":
-			return "LOW";
-		case "medium":
-			return "MEDIUM";
-		case "high":
-		case "xhigh":
-		case "max":
-			return "HIGH";
-	}
+	throw new Error(`Unsupported Google thinking level "${reasoning}" for model "${model.id}"`);
 }
 
 function getGemini25ThinkingBudget(modelId: string, reasoning: NonNullable<SimpleStreamOptions["reasoning"]>): number {
@@ -1404,18 +1398,14 @@ export function getThinkingLevelMap(
 	metadata: PublicModelMetadata | undefined,
 ): ThinkingLevelMap | undefined {
 	const candidates = getModelRouteCandidates(id, metadata);
-	// Gemini 2.5 Pro requires token budgets, not effort strings.
-	if (candidates.some(isGemini25ProModelId)) return getGeminiThinkingLevelMap(candidates);
 	if (metadata?.reasoningEfforts !== undefined) {
-		const efforts = new Set(metadata.reasoningEfforts);
-		const map: ThinkingLevelMap = {};
-		for (const level of PI_THINKING_LEVELS) {
-			map[level] = efforts.has(level) ? level : null;
-		}
-		// OpenAI names its disabled effort "none" rather than pi's "off".
-		if (efforts.has("none")) map.off = "none";
-		return map;
+		return getEffortThinkingLevelMap(metadata.reasoningEfforts);
 	}
+
+	// Gemini token budgets are a fallback only when no effort data is available.
+	const geminiBudgetMap = getGeminiBudgetThinkingLevelMap(candidates);
+	if (geminiBudgetMap) return geminiBudgetMap;
+	if (candidates.some(isGoogleModelId)) return getEffortThinkingLevelMap([]);
 
 	if (candidates.some(isDeepSeekModelId) || candidates.some(isGlmModelId)) {
 		return {
@@ -1429,12 +1419,22 @@ export function getThinkingLevelMap(
 	}
 
 	return (
-		getGeminiThinkingLevelMap(candidates) ??
 		getClaudeThinkingLevelMap(candidates) ??
 		getOpenAiThinkingLevelMap(candidates) ??
 		getGrokThinkingLevelMap(candidates) ??
 		getKimiThinkingLevelMap(candidates)
 	);
+}
+
+function getEffortThinkingLevelMap(values: string[]): ThinkingLevelMap {
+	const efforts = new Set(values);
+	const map: ThinkingLevelMap = {};
+	for (const level of PI_THINKING_LEVELS) {
+		map[level] = efforts.has(level) ? level : null;
+	}
+	// OpenAI names its disabled effort "none" rather than pi's "off".
+	if (efforts.has("none")) map.off = "none";
+	return map;
 }
 
 function getGrokThinkingLevelMap(candidates: string[]): ThinkingLevelMap | undefined {
@@ -1483,24 +1483,19 @@ function getKimiThinkingLevelMap(candidates: string[]): ThinkingLevelMap | undef
 	return undefined;
 }
 
-function getGeminiThinkingLevelMap(candidates: string[]): ThinkingLevelMap | undefined {
-	if (candidates.some(isGemini31ProModelId)) {
-		return { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: null, max: null };
-	}
-	if (candidates.some(isGemini3ProModelId)) {
-		return { off: null, minimal: null, low: "low", medium: null, high: "high", xhigh: null, max: null };
-	}
-	if (candidates.some(isGemini3ModelId)) {
-		return { off: null, minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: null, max: null };
-	}
-	if (candidates.some(isGemini25ProModelId)) {
-		return { off: null, minimal: "128", low: "2048", medium: "8192", high: "32768", xhigh: null, max: null };
-	}
-	if (candidates.some(isGemini25ModelId)) {
-		return { minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: null, max: null };
-	}
+function getGeminiBudgetThinkingLevelMap(candidates: string[]): ThinkingLevelMap | undefined {
+	const modelId = candidates.find(isGemini25ModelId);
+	if (!modelId) return undefined;
 
-	return undefined;
+	const map: ThinkingLevelMap = {
+		...(isGemini25ProModelId(modelId) ? { off: null } : {}),
+		xhigh: null,
+		max: null,
+	};
+	for (const level of ["minimal", "low", "medium", "high"] as const) {
+		map[level] = String(getGemini25ThinkingBudget(modelId, level));
+	}
+	return map;
 }
 
 function getClaudeThinkingLevelMap(candidates: string[]): ThinkingLevelMap | undefined {
@@ -1680,14 +1675,6 @@ function isGemini25ProModelId(id: string): boolean {
 
 function isGemini3ModelId(id: string): boolean {
 	return /gemini-3(?:\.\d+)?-/.test(id);
-}
-
-function isGemini31ProModelId(id: string): boolean {
-	return id.includes("gemini-3.1-pro");
-}
-
-function isGemini3ProModelId(id: string): boolean {
-	return id.includes("gemini-3-pro") || id.includes("gemini-3.0-pro");
 }
 
 function isClaudeThinkingModelId(id: string): boolean {

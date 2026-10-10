@@ -4,7 +4,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { getThinkingLevelMap, parsePublicModelMetadataEntries, readCachedPublicModelMetadata } from "../index.js";
+import {
+	getGoogleThinkingConfig,
+	getThinkingLevelMap,
+	parsePublicModelMetadataEntries,
+	readCachedPublicModelMetadata,
+} from "../index.js";
 
 const MODEL_ID = "gpt-5.4";
 const CANONICAL_ID = `openai/${MODEL_ID}`;
@@ -137,8 +142,8 @@ test("old and malformed cache entries keep the fallback", () => {
 	assert.equal(readCachedPublicModelMetadata({ reasoningEfforts: ["high", null] })?.reasoningEfforts, undefined);
 });
 
-test("Gemini 2.5 Pro token mappings remain unchanged even with effort metadata", () => {
-	const map = getThinkingLevelMap("gemini-2.5-pro", { reasoningEfforts: ["low", "high"] });
+test("Gemini 2.5 Pro token mappings remain unchanged without effort metadata", () => {
+	const map = getThinkingLevelMap("gemini-2.5-pro", undefined);
 	assert.deepEqual(map, {
 		off: null,
 		minimal: "128",
@@ -148,6 +153,108 @@ test("Gemini 2.5 Pro token mappings remain unchanged even with effort metadata",
 		xhigh: null,
 		max: null,
 	});
+});
+
+test("generic effort mapping precedes Gemini budget fallback", () => {
+	const id = "gemini-2.5-pro";
+	const map = getThinkingLevelMap(id, { reasoningEfforts: ["low", "high"] });
+	assert.deepEqual(map, {
+		off: null,
+		minimal: null,
+		low: "low",
+		medium: null,
+		high: "high",
+		xhigh: null,
+		max: null,
+	});
+	assert.deepEqual(getGoogleThinkingConfig({ id, thinkingLevelMap: map }, "high"), {
+		enabled: true,
+		level: "HIGH",
+	});
+	assert.throws(
+		() => getGoogleThinkingConfig({ id, thinkingLevelMap: map }, "medium"),
+		/Unsupported Google thinking level/,
+	);
+	const emptyMap = getThinkingLevelMap(id, { reasoningEfforts: [] });
+	assert.ok(Object.values(emptyMap ?? {}).every((value) => value === null));
+	assert.throws(
+		() => getGoogleThinkingConfig({ id, thinkingLevelMap: emptyMap }, "high"),
+		/Unsupported Google thinking level/,
+	);
+});
+
+test("Gemini named levels come from official catalog data, not model-name rules", () => {
+	for (const id of ["gemini-3-pro-preview", "gemini-3.1-pro-preview", "gemini-3.8-flash"]) {
+		const metadata = metadataFrom(
+			{
+				google: { models: { [id]: { reasoning_options: [{ type: "effort", values: ["medium"] }] } } },
+			},
+			id,
+		);
+		const map = getThinkingLevelMap(id, metadata);
+		assert.deepEqual(map, {
+			off: null,
+			minimal: null,
+			low: null,
+			medium: "medium",
+			high: null,
+			xhigh: null,
+			max: null,
+		});
+		assert.deepEqual(getGoogleThinkingConfig({ id, thinkingLevelMap: map }, "medium"), {
+			enabled: true,
+			level: "MEDIUM",
+		});
+		assert.throws(
+			() => getGoogleThinkingConfig({ id, thinkingLevelMap: map }, "high"),
+			/Unsupported Google thinking level/,
+		);
+	}
+});
+
+test("Gemini without effort data does not infer named levels", () => {
+	for (const id of ["gemini-3-pro-preview", "gemini-3.1-pro-preview", "google/gemini-3-flash-preview"]) {
+		const map = getThinkingLevelMap(id, undefined);
+		assert.deepEqual(map, { off: null, minimal: null, low: null, medium: null, high: null, xhigh: null, max: null });
+		assert.throws(
+			() => getGoogleThinkingConfig({ id, thinkingLevelMap: map }, "low"),
+			/Unsupported Google thinking level/,
+		);
+	}
+});
+
+test("Gemini request formatting uses the installed effort map", () => {
+	const id = "gemini-3-flash-preview";
+	for (const [effort, level] of [
+		["minimal", "MINIMAL"],
+		["low", "LOW"],
+		["medium", "MEDIUM"],
+		["high", "HIGH"],
+		["xhigh", "HIGH"],
+		["max", "HIGH"],
+	]) {
+		assert.deepEqual(getGoogleThinkingConfig({ id, thinkingLevelMap: { high: effort } }, "high"), {
+			enabled: true,
+			level,
+		});
+	}
+	assert.deepEqual(getGoogleThinkingConfig({ id }, undefined), { enabled: false });
+});
+
+test("Gemini 2.5 budget mapping and request configuration use the same conversion", () => {
+	for (const id of ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"]) {
+		const map = getThinkingLevelMap(id, undefined);
+		assert.deepEqual(getGoogleThinkingConfig({ id, thinkingLevelMap: map }, "high"), {
+			enabled: true,
+			budgetTokens: Number(map?.high),
+		});
+	}
+	const minimumProBudget = 128;
+	assert.deepEqual(getGoogleThinkingConfig({ id: "gemini-2.5-pro" }, undefined), {
+		enabled: true,
+		budgetTokens: minimumProBudget,
+	});
+	assert.deepEqual(getGoogleThinkingConfig({ id: "gemini-2.5-flash" }, undefined), { enabled: false });
 });
 
 test("DeepSeek effort data and legacy mappings both retain high/max", () => {
