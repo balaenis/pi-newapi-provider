@@ -54,6 +54,20 @@ export NEWAPI_MODELS="gpt-4o-mini,qwen3-coder"
 export NEWAPI_FETCH_MODELS=false
 ```
 
+## Thinking levels
+
+The extension reads model facts and official provider reasoning options from
+[models.dev/catalog.json](https://models.dev/catalog.json). It keeps model-only context limits and input capabilities.
+
+- Effort values with the same pi name map directly: `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`.
+- Missing levels map to `null`. Unknown values do not enable a pi level.
+- The provider value `none` maps to pi's `off`.
+- Token budgets, including Gemini 2.5 Pro budgets, keep their existing hardcoded mappings.
+- Models without effort data keep their existing hardcoded mappings. Toggle and budget controls are not treated as effort lists.
+- The local metadata cache stores the effort values for offline startup.
+
+`NEWAPI_MODELS_DEV_URL` can override the catalog URL. The parser also accepts the legacy flat `models.json` format and provider-only `api.json`. A flat model-only source does not supply effort values.
+
 ## Model cache
 
 Model discovery cache is enabled by default to keep pi startup fast after the first successful discovery. Cache files are stored under `~/.pi/agent/cache/newapi-provider/`.

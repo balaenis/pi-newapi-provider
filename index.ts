@@ -101,6 +101,7 @@ interface PublicModelMetadata {
 	id?: string;
 	name?: string;
 	reasoning?: boolean;
+	reasoningEfforts?: string[];
 	input?: ModelInput[];
 	contextWindow?: number;
 	maxTokens?: number;
@@ -172,7 +173,7 @@ const PROVIDER_NAME = process.env.NEWAPI_PROVIDER_NAME?.trim() || "NewAPI Gatewa
 const BASE_URL = normalizeGatewayBaseUrl(
 	MODELS_JSON_PROVIDER_CONFIG?.baseUrl ?? process.env.NEWAPI_BASE_URL ?? "http://localhost:3000",
 );
-const MODELS_DEV_URL = process.env.NEWAPI_MODELS_DEV_URL?.trim() || "https://models.dev/models.json";
+const MODELS_DEV_URL = process.env.NEWAPI_MODELS_DEV_URL?.trim() || "https://models.dev/catalog.json";
 // Credential env key holding the base URL entered at /login; the ambient env
 // names mirror it so auth.json and environment configuration stay in sync.
 const NEWAPI_BASE_URL_ENV_NAME = "NEWAPI_BASE_URL";
@@ -351,7 +352,7 @@ function readPublicModelMetadataCacheValue(value: unknown): PublicModelMetadataC
 	return entries;
 }
 
-function readCachedPublicModelMetadata(value: unknown): PublicModelMetadata | undefined {
+export function readCachedPublicModelMetadata(value: unknown): PublicModelMetadata | undefined {
 	const record = asRecord(value);
 	if (!record) return undefined;
 
@@ -365,6 +366,9 @@ function readCachedPublicModelMetadata(value: unknown): PublicModelMetadata | un
 	if (id) metadata.id = id;
 	if (name) metadata.name = name;
 	if (typeof record.reasoning === "boolean") metadata.reasoning = record.reasoning;
+	if (Array.isArray(record.reasoningEfforts) && record.reasoningEfforts.every((value) => typeof value === "string")) {
+		metadata.reasoningEfforts = record.reasoningEfforts;
+	}
 	if (input) metadata.input = input;
 	if (contextWindow) metadata.contextWindow = contextWindow;
 	if (maxTokens) metadata.maxTokens = maxTokens;
@@ -1143,20 +1147,7 @@ async function fetchPublicModelMetadataEntries(
 		const payload = asRecord(await response.json());
 		if (!payload) return [];
 
-		const entries: PublicModelMetadataCacheValue = [];
-		for (const [key, value] of Object.entries(payload)) {
-			if (!isOfficialModelsDevId(key)) continue;
-
-			const model = asRecord(value);
-			if (!model) continue;
-
-			const metadata = toPublicModelMetadata(model);
-			for (const lookupId of getPublicModelLookupIds(key, metadata.id ?? key)) {
-				entries.push({ lookupId: normalizeModelLookupId(lookupId), metadata });
-			}
-		}
-
-		return entries;
+		return parsePublicModelMetadataEntries(payload);
 	} catch (error) {
 		if (signal?.aborted) return undefined;
 		notify(
@@ -1165,6 +1156,48 @@ async function fetchPublicModelMetadataEntries(
 		);
 		return undefined;
 	}
+}
+
+export function parsePublicModelMetadataEntries(payload: Record<string, unknown>): PublicModelMetadataCacheValue {
+	const entries: PublicModelMetadataCacheValue = [];
+	const models = asRecord(payload.models) ?? payload;
+	for (const [key, value] of Object.entries(models)) {
+		if (!isOfficialModelsDevId(key)) continue;
+
+		const model = asRecord(value);
+		if (!model) continue;
+
+		const metadata = toPublicModelMetadata(model);
+		for (const lookupId of getPublicModelLookupIds(key, metadata.id ?? key)) {
+			entries.push({ lookupId: normalizeModelLookupId(lookupId), metadata });
+		}
+	}
+
+	const metadataById = toPublicModelMetadataMap(entries);
+	const providers = asRecord(payload.providers) ?? (entries.length === 0 ? payload : undefined);
+	if (providers) {
+		for (const [providerId, value] of Object.entries(providers)) {
+			const providerModels = asRecord(asRecord(value)?.models);
+			if (!providerModels) continue;
+			for (const [modelId, value] of Object.entries(providerModels)) {
+				const key = `${providerId}/${modelId}`;
+				if (!isOfficialModelsDevId(key)) continue;
+				const model = asRecord(value);
+				if (!model) continue;
+				const providerMetadata = toPublicModelMetadata(model);
+				const metadata = { ...(metadataById.get(normalizeModelLookupId(key)) ?? providerMetadata) };
+				if (providerMetadata.reasoningEfforts !== undefined) {
+					metadata.reasoningEfforts = providerMetadata.reasoningEfforts;
+				}
+				// Keep canonical IDs for routing even when the provider uses a bare model ID.
+				metadata.id = key;
+				for (const lookupId of getPublicModelLookupIds(key, key)) {
+					entries.push({ lookupId: normalizeModelLookupId(lookupId), metadata });
+				}
+			}
+		}
+	}
+	return entries;
 }
 
 function toPublicModelMetadataMap(entries: PublicModelMetadataCacheValue): Map<string, PublicModelMetadata> {
@@ -1188,6 +1221,22 @@ function toPublicModelMetadata(model: Record<string, unknown>): PublicModelMetad
 	if (id) metadata.id = id;
 	if (name) metadata.name = name;
 	if (typeof model.reasoning === "boolean") metadata.reasoning = model.reasoning;
+	if (Array.isArray(model.reasoning_options)) {
+		const efforts = model.reasoning_options
+			.map(asRecord)
+			.filter((option) => option?.type === "effort" && Array.isArray(option.values));
+		if (efforts.length > 0) {
+			metadata.reasoningEfforts = [
+				...new Set(
+					efforts.flatMap((option) =>
+						(option!.values as unknown[]).filter(
+							(value): value is string => typeof value === "string" && value !== "null",
+						),
+					),
+				),
+			];
+		}
+	}
 	if (input) metadata.input = input;
 	if (contextWindow) metadata.contextWindow = contextWindow;
 	if (maxTokens) metadata.maxTokens = maxTokens;
@@ -1349,8 +1398,25 @@ function getThinkingFormat(candidates: string[]): ThinkingFormat | undefined {
 	return undefined;
 }
 
-function getThinkingLevelMap(id: string, metadata: PublicModelMetadata | undefined): ThinkingLevelMap | undefined {
+const PI_THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+export function getThinkingLevelMap(
+	id: string,
+	metadata: PublicModelMetadata | undefined,
+): ThinkingLevelMap | undefined {
 	const candidates = getModelRouteCandidates(id, metadata);
+	// Gemini 2.5 Pro requires token budgets, not effort strings.
+	if (candidates.some(isGemini25ProModelId)) return getGeminiThinkingLevelMap(candidates);
+	if (metadata?.reasoningEfforts !== undefined) {
+		const efforts = new Set(metadata.reasoningEfforts);
+		const map: ThinkingLevelMap = {};
+		for (const level of PI_THINKING_LEVELS) {
+			map[level] = efforts.has(level) ? level : null;
+		}
+		// OpenAI names its disabled effort "none" rather than pi's "off".
+		if (efforts.has("none")) map.off = "none";
+		return map;
+	}
 
 	if (candidates.some(isDeepSeekModelId) || candidates.some(isGlmModelId)) {
 		return {

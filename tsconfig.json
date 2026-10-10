@@ -11,6 +11,6 @@
 		"skipLibCheck": true,
 		"types": ["node"]
 	},
-	"include": ["index.ts"],
+	"include": ["index.ts", "tests/**/*.ts"],
 	"exclude": ["node_modules", "dist", "coverage"]
 }
